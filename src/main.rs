@@ -1,8 +1,20 @@
 use std::arch::x86_64::{
-    __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_extract_epi32,
-    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mullo_epi32,
-    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_epi8, _mm256_setzero_si256,
-    _mm256_storeu_si256, _mm256_sub_epi32,
+    __m256,
+    __m256i,
+    _mm256_add_epi32,
+    _mm256_broadcast_ss, //_mm256_extract_epi32,
+    _mm256_loadu_si256,
+    _mm256_madd_epi16,
+    _mm256_maddubs_epi16,
+    _mm256_maskload_epi32,
+    _mm256_mullo_epi32,
+    _mm256_set1_epi16,
+    _mm256_set1_epi32,
+    _mm256_set1_epi8,
+    _mm256_setr_epi32,
+    _mm256_setzero_si256,
+    _mm256_storeu_si256,
+    _mm256_sub_epi32,
 };
 
 fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
@@ -23,6 +35,29 @@ fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
             }
         }
     }
+    out
+}
+
+fn pack_a(vals: &[u8], a_rows: usize, a_cols: usize) -> Vec<u8> {
+    const MR: usize = 6;
+    assert!(a_rows % MR == 0);
+    assert!(a_cols % 4 == 0);
+
+    let a_row_stride = a_cols;
+
+    let mut out = Vec::new();
+    for col_block in 0..a_cols / 4 {
+        for row_block in 0..a_rows / MR {
+            for row_off in 0..MR {
+                for col_off in 0..4 {
+                    let y = row_block * MR + row_off;
+                    let x = col_block * 4 + col_off;
+                    out.push(vals[y * a_row_stride + x]);
+                }
+            }
+        }
+    }
+
     out
 }
 
@@ -74,7 +109,7 @@ unsafe fn matmul_int(
     let a_ptr = a.as_ptr();
     let c_ptr = c.as_mut_ptr();
 
-    let a_row_stride = k;
+    // let a_row_stride = k;
     let c_row_stride = n;
 
     // The value for each output cell is computed as:
@@ -94,6 +129,8 @@ unsafe fn matmul_int(
         let b_off = col_block * n_depth_blocks * 8 * 4;
 
         for row_block in 0..n_row_blocks {
+            let a_off = row_block * n_depth_blocks * MR * 4;
+
             // Sums along each row of `a`.
             let mut a_sum = _mm256_setzero_si256();
             // Sums along each column of `b`.
@@ -101,6 +138,9 @@ unsafe fn matmul_int(
 
             let mut tmp = [c_init; MR];
             let one = _mm256_set1_epi16(1);
+
+            let mask = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
+
             for k_block in 0..n_depth_blocks {
                 let bv = _mm256_loadu_si256(
                     b_ptr.add(b_off + k_block * size_of::<__m256i>()) as *const __m256i
@@ -108,23 +148,24 @@ unsafe fn matmul_int(
                 b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8(bv));
 
                 // An MR * 4 slice of A.
-                let mut a_vals = [0i32; 8];
+                // let mut a_vals = [0i32; 8];
+                let a_vals = _mm256_maskload_epi32(
+                    a_ptr.add(a_off + k_block * size_of::<__m256i>()) as *const i32,
+                    mask,
+                );
 
                 for i in 0..MR {
                     let av = _mm256_broadcast_ss(std::mem::transmute::<*const u8, &f32>(
-                        a_ptr.add((row_block * MR + i) * a_row_stride + k_block * 4),
+                        a_ptr.add(a_off + k_block * size_of::<__m256i>() + i), // a_ptr.add((row_block * MR + i) * a_row_stride + k_block * 4),
                     ));
                     let av = std::mem::transmute::<__m256, __m256i>(av);
-
-                    a_vals[i] = _mm256_extract_epi32(av, 0);
 
                     let z = _mm256_maddubs_epi16(av, bv);
                     let z = _mm256_madd_epi16(z, one);
                     tmp[i] = _mm256_add_epi32(tmp[i], z);
                 }
 
-                let a_col = _mm256_loadu_si256(a_vals.as_ptr() as *const __m256i);
-                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8(a_col));
+                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8(a_vals));
             }
 
             let a_sum = _mm256_mullo_epi32(a_sum, _mm256_set1_epi32(b_zero_point as i32));
@@ -260,6 +301,7 @@ fn main() {
     // println!("\nB:");
     // print_mat(&b, k, n);
 
+    let packed_a = pack_a(&a, m, k);
     let packed_b = pack_b(&b, k, n);
 
     let start = std::time::Instant::now();
@@ -267,7 +309,18 @@ fn main() {
     for _ in 0..n_iters {
         // TODO - Fold this into `matmul_int` as a `beta` argument.
         c.fill(0);
-        unsafe { matmul_int(&mut c, &a, &packed_b, a_zero_point, b_zero_point, m, n, k) };
+        unsafe {
+            matmul_int(
+                &mut c,
+                &packed_a,
+                &packed_b,
+                a_zero_point,
+                b_zero_point,
+                m,
+                n,
+                k,
+            )
+        };
     }
 
     let duration = start.elapsed();
