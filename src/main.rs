@@ -1,234 +1,49 @@
-use std::arch::asm;
-use std::arch::x86_64::{
-    __m256,
-    __m256i,
-    _mm256_add_epi32,
-    _mm256_broadcast_ss, //_mm256_extract_epi32,
-    _mm256_loadu_si256,
-    _mm256_madd_epi16,
-    _mm256_maddubs_epi16,
-    _mm256_maskload_epi32,
-    _mm256_mullo_epi32,
-    _mm256_set1_epi16,
-    _mm256_set1_epi32,
-    _mm256_set1_epi8,
-    _mm256_setzero_si256,
-    _mm256_storeu_si256,
-    _mm256_sub_epi32,
-};
+mod arch;
+mod packing;
 
-/// Whether to use AVX-VNNI instructions. This improves performance by
-/// performing u8 x i8 -> i32 dot products with one instruction instead of
-/// three.
-const USE_VNNI: bool = false;
+/// Trait implemented by integer matmul kernels.
+///
+/// # Safety
+///
+/// The [`new`](Self::new) method must return `None` if the kernel is not
+/// supported on the current system.
+unsafe trait Kernel {
+    /// Construct kernel if supported on current system.
+    fn new() -> Option<Self>
+    where
+        Self: Sized;
 
-/// Number of rows in tiles used by microkernel. Empirically 7 is the maximum
-/// value for the current implementation and performance drops a lot with
-/// larger values.
-const MR: usize = 7;
+    /// Return number of rows in this kernel's microtile.
+    fn mr(&self) -> usize;
 
-// Pack blocks of the B matrix for use by the matmul kernel.
-//
-// Pack B matrix of shape `[K, N]` into a layout with shape `[N / 8, K / 4, 8,
-// 4]`.
-fn pack_b(out: &mut [i8], vals: &[i8], b_rows: usize, b_cols: usize) {
-    assert!(b_cols % 8 == 0);
-    assert!(b_cols % 4 == 0);
-    assert!(out.len() == b_rows * b_cols);
+    /// Return number of columns in this kernel's microtile.
+    fn nr(&self) -> usize;
 
-    let b_row_stride = b_cols;
-    let mut out_off = 0;
+    /// Return size of packing buffer required by `pack_a`.
+    fn packed_a_size(&self, a_rows: usize, a_cols: usize) -> usize;
 
-    for col_block in 0..b_cols / 8 {
-        for row_block in 0..b_rows / 4 {
-            for col_off in 0..8 {
-                for row_off in 0..4 {
-                    let y = row_block * 4 + row_off;
-                    let x = col_block * 8 + col_off;
-                    unsafe {
-                        *out.get_unchecked_mut(out_off) = *vals.get_unchecked(y * b_row_stride + x);
-                        out_off += 1;
-                    }
-                }
-            }
-        }
-    }
-}
+    /// Pack an input LHS / "A" matrix
+    fn pack_a(&self, out: &mut [u8], a: &[u8], a_rows: usize, a_cols: usize);
 
-// Pack blocks of the A matrix for use by the matmul kernel.
-//
-// Pack A matrix of shape `[M, K]` into a layout with shape `[K / 4, M / MR, MR,
-// 4]`.
-fn pack_a(out: &mut [u8], vals: &[u8], a_rows: usize, a_cols: usize) {
-    assert!(a_rows % MR == 0);
-    assert!(a_cols % 4 == 0);
-    assert!(out.len() == a_rows * a_cols);
+    /// Return size of packing buffer required by `pack_b`.
+    fn packed_b_size(&self, b_rows: usize, b_cols: usize) -> usize;
 
-    let a_row_stride = a_cols;
-    let mut out_off = 0;
+    /// Pack an input RHS / "B" matrix
+    fn pack_b(&self, out: &mut [i8], b: &[i8], b_rows: usize, b_cols: usize);
 
-    for col_block in 0..a_cols / 4 {
-        for row_block in 0..a_rows / MR {
-            for row_off in 0..MR {
-                for col_off in 0..4 {
-                    let y = row_block * MR + row_off;
-                    let x = col_block * 4 + col_off;
-                    unsafe {
-                        *out.get_unchecked_mut(out_off) = *vals.get_unchecked(y * a_row_stride + x);
-                        out_off += 1;
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn dot_u8i8x32_i32x4(mut out: __m256i, x: __m256i, y: __m256i) -> __m256i {
-    if USE_VNNI {
-        asm! {
-            "vpdpbusd {result}, {x}, {y}",
-            result = inout(ymm_reg) out,
-            x = in(ymm_reg) x,
-            y = in(ymm_reg) y,
-            options(nostack)
-        }
-        out
-    } else {
-        let tmp = _mm256_maddubs_epi16(x, y);
-        let tmp = _mm256_madd_epi16(tmp, _mm256_set1_epi16(1));
-        _mm256_add_epi32(out, tmp)
-    }
-}
-
-/// Sum each group of 4 adjacent i8 values and produce i32 results.
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn add_i8x32_i32x8(x: __m256i) -> __m256i {
-    let one = _mm256_set1_epi8(1);
-    dot_u8i8x32_i32x4(_mm256_setzero_si256(), one, x)
-}
-
-/// Sum each group of 4 adjacent u8 values and produce i32 results.
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn add_u8x32_i32x8(x: __m256i) -> __m256i {
-    let one = _mm256_set1_epi8(1);
-    dot_u8i8x32_i32x4(_mm256_setzero_si256(), x, one)
-}
-
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn matmul_int(
-    c: &mut [i32],
-    a: &[u8],
-    b: &[i8],
-    a_zero_point: u8,
-    b_zero_point: i8,
-    m: usize,
-    n: usize,
-    k: usize,
-) {
-    assert!(k % 4 == 0);
-    assert!(m % MR == 0);
-    assert!(n % 8 == 0);
-
-    let col_block_size = 8;
-    let row_block_size = MR;
-    let depth_block_size = 4;
-    let n_col_blocks = n / col_block_size;
-    let n_row_blocks = m / MR;
-    let n_depth_blocks = k / depth_block_size;
-
-    let b_ptr = b.as_ptr();
-    let a_ptr = a.as_ptr();
-    let c_ptr = c.as_mut_ptr();
-
-    // let a_row_stride = k;
-    let c_row_stride = n;
-
-    // The value for each output cell is computed as:
-    //
-    // c = (a[0] - a_zero_point) * (b[0] - b_zero_point) + ...
-    //
-    // This can be expanded and re-arranged into:
-    //
-    // c = a[0]b[0] - a[0] * b_zero_point - b[0] * a_zero_point + a_zero_point * b_zero_point + ...
-    // c = dot(a, b) - sum(a) * b_zero_point - sum(b) * a_zero_point + ... + len(a) * a_zero_point * b_zero_point
-    //
-    // The final term of the above equation does not depend on any individual
-    // elements, so is pre-computed and used as the initialization value for
-    // each output tile. Note that this assumes a single zero-point value per
-    // tensor.
-    //
-    // The accumulation of the sum of each row of a and each column of b are
-    // interleaved with the dot product and subtracted from the temporary `c`
-    // value at the end.
-    let c_init = _mm256_mullo_epi32(
-        _mm256_set1_epi32(k as i32),
-        _mm256_mullo_epi32(
-            _mm256_set1_epi32(a_zero_point as i32),
-            _mm256_set1_epi32(b_zero_point as i32),
-        ),
+    /// Perform a matrix multiplication of two packed inputs into an output
+    /// `c` buffer.
+    fn matmul(
+        &self,
+        c: &mut [i32],
+        packed_a: &[u8],
+        packed_b: &[i8],
+        a_zero_point: u8,
+        b_zero_point: i8,
+        a_rows: usize,
+        b_cols: usize,
+        a_cols: usize,
     );
-
-    // Mask which is set for the first `MR` elements.
-    let mask_values: [i32; 8] = std::array::from_fn(|i| if i < MR { -1 } else { 0 });
-    let mask = _mm256_loadu_si256(mask_values.as_ptr() as *const __m256i);
-
-    for col_block in 0..n_col_blocks {
-        let b_off = col_block * n_depth_blocks * 8 * 4;
-
-        for row_block in 0..n_row_blocks {
-            let a_off = row_block * n_depth_blocks * MR * 4;
-
-            // Sums along each row of `a`.
-            let mut a_sum = _mm256_setzero_si256();
-            // Sums along each column of `b`.
-            let mut b_sum = _mm256_setzero_si256();
-
-            let mut tmp = [c_init; MR];
-
-            for k_block in 0..n_depth_blocks {
-                let bv = _mm256_loadu_si256(
-                    b_ptr.add(b_off + k_block * size_of::<__m256i>()) as *const __m256i
-                );
-                b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8(bv));
-
-                // An MR * 4 slice of A.
-                // let mut a_vals = [0i32; 8];
-                let a_vals = _mm256_maskload_epi32(
-                    a_ptr.add(a_off + k_block * size_of::<__m256i>()) as *const i32,
-                    mask,
-                );
-
-                for i in 0..MR {
-                    let av = _mm256_broadcast_ss(std::mem::transmute::<*const u8, &f32>(
-                        a_ptr.add(a_off + k_block * size_of::<__m256i>() + i),
-                    ));
-                    let av = std::mem::transmute::<__m256, __m256i>(av);
-
-                    tmp[i] = dot_u8i8x32_i32x4(tmp[i], av, bv);
-                }
-
-                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8(a_vals));
-            }
-
-            let a_sum = _mm256_mullo_epi32(a_sum, _mm256_set1_epi32(b_zero_point as i32));
-            let a_sums = to_array::<i32, 8>(a_sum);
-            let b_sum = _mm256_mullo_epi32(b_sum, _mm256_set1_epi32(a_zero_point as i32));
-
-            for i in 0..MR {
-                let c_off =
-                    (row_block * row_block_size + i) * c_row_stride + (col_block * col_block_size);
-                let z = tmp[i];
-                let z = _mm256_sub_epi32(z, b_sum);
-                let z = _mm256_sub_epi32(z, _mm256_set1_epi32(a_sums[i]));
-                _mm256_storeu_si256(c_ptr.add(c_off) as *mut __m256i, z);
-            }
-        }
-    }
 }
 
 #[allow(unused)]
@@ -302,20 +117,10 @@ fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     }
 }
 
-/// Convert a SIMD vector into a `[T; N]` array.
-fn to_array<T: Copy + Default, const N: usize>(x: __m256i) -> [T; N] {
-    assert_eq!(size_of::<T>() * N, size_of::<__m256i>());
-    let mut out = [T::default(); N];
-    unsafe {
-        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, x);
-    }
-    out
-}
-
-fn main() {
-    let m = std::hint::black_box(MR * 100);
-    let n = std::hint::black_box(8 * 100);
-    let k = std::hint::black_box(4 * 100);
+fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
+    let m = std::hint::black_box(kernel.mr() * scale);
+    let n = std::hint::black_box(kernel.nr() * scale);
+    let k = std::hint::black_box(4 * scale);
 
     let a: Vec<u8> = (0..m * k).map(|x| x as u8).collect();
     let b: Vec<i8> = (0..k * n).map(|x| x as i8).collect();
@@ -323,27 +128,23 @@ fn main() {
     let a_zero_point = 5;
     let b_zero_point = -5;
 
-    let mut packed_a = vec![0; m * k];
-    let mut packed_b = vec![0; k * n];
+    let mut packed_a = vec![0; kernel.packed_a_size(m, k)];
+    let mut packed_b = vec![0; kernel.packed_b_size(k, n)];
 
     let start = std::time::Instant::now();
-    let n_iters = 1000;
     for _ in 0..n_iters {
-        pack_a(&mut packed_a, &a, m, k);
-        pack_b(&mut packed_b, &b, k, n);
-
-        unsafe {
-            matmul_int(
-                &mut c,
-                &packed_a,
-                &packed_b,
-                a_zero_point,
-                b_zero_point,
-                m,
-                n,
-                k,
-            )
-        };
+        kernel.pack_a(&mut packed_a, &a, m, k);
+        kernel.pack_b(&mut packed_b, &b, k, n);
+        kernel.matmul(
+            &mut c,
+            &packed_a,
+            &packed_b,
+            a_zero_point,
+            b_zero_point,
+            m,
+            n,
+            k,
+        )
     }
 
     let duration = start.elapsed();
@@ -363,17 +164,13 @@ fn main() {
     } else {
         println!("Reference and optimized implementations DO NOT MATCH.");
     }
+}
 
-    // let ref_c_opt = reference_matmul_int_opt_zp(&a, &b, a_zero_point, b_zero_point, m, n, k);
-
-    // println!("\nOptimized:");
-    // print_mat(&c, m, n);
-
-    // println!("");
-    // println!("Reference:");
-    // print_mat(&ref_c, m, n);
-
-    // println!("");
-    // println!("Reference (optimized zero-point):");
-    // print_mat(&ref_c_opt, m, n);
+fn main() {
+    let kernel = arch::new_kernel();
+    test_kernel(
+        kernel.as_ref(),
+        1_000, /* n_iters */
+        100,   /* scale */
+    );
 }
