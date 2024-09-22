@@ -17,6 +17,8 @@ use std::arch::x86_64::{
     _mm256_sub_epi32,
 };
 
+const MR: usize = 6;
+
 fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
     assert!(b_cols % 8 == 0);
     assert!(b_cols % 4 == 0);
@@ -39,7 +41,6 @@ fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
 }
 
 fn pack_a(vals: &[u8], a_rows: usize, a_cols: usize) -> Vec<u8> {
-    const MR: usize = 6;
     assert!(a_rows % MR == 0);
     assert!(a_cols % 4 == 0);
 
@@ -93,7 +94,6 @@ unsafe fn matmul_int(
     n: usize,
     k: usize,
 ) {
-    const MR: usize = 6;
     assert!(k % 4 == 0);
     assert!(m % MR == 0);
     assert!(n % 8 == 0);
