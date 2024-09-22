@@ -329,8 +329,6 @@ fn main() {
     let start = std::time::Instant::now();
     let n_iters = 1000;
     for _ in 0..n_iters {
-        // TODO - Fold this into `matmul_int` as a `beta` argument.
-        c.fill(0);
         pack_a(&mut packed_a, &a, m, k);
         pack_b(&mut packed_b, &b, k, n);
 
