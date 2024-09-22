@@ -1,3 +1,4 @@
+use std::arch::asm;
 use std::arch::x86_64::{
     __m256,
     __m256i,
@@ -11,13 +12,20 @@ use std::arch::x86_64::{
     _mm256_set1_epi16,
     _mm256_set1_epi32,
     _mm256_set1_epi8,
-    _mm256_setr_epi32,
     _mm256_setzero_si256,
     _mm256_storeu_si256,
     _mm256_sub_epi32,
 };
 
-const MR: usize = 6;
+/// Whether to use AVX-VNNI instructions. This improves performance by
+/// performing u8 x i8 -> i32 dot products with one instruction instead of
+/// three.
+const USE_VNNI: bool = false;
+
+/// Number of rows in tiles used by microkernel. Empirically 7 is the maximum
+/// value for the current implementation and performance drops a lot with
+/// larger values.
+const MR: usize = 7;
 
 // Pack blocks of the B matrix for use by the matmul kernel.
 //
@@ -75,14 +83,31 @@ fn pack_a(out: &mut [u8], vals: &[u8], a_rows: usize, a_cols: usize) {
     }
 }
 
+#[target_feature(enable = "avx")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_u8i8x32_i32x4(mut out: __m256i, x: __m256i, y: __m256i) -> __m256i {
+    if USE_VNNI {
+        asm! {
+            "vpdpbusd {result}, {x}, {y}",
+            result = inout(ymm_reg) out,
+            x = in(ymm_reg) x,
+            y = in(ymm_reg) y,
+            options(nostack)
+        }
+        out
+    } else {
+        let tmp = _mm256_maddubs_epi16(x, y);
+        let tmp = _mm256_madd_epi16(tmp, _mm256_set1_epi16(1));
+        _mm256_add_epi32(out, tmp)
+    }
+}
+
 /// Sum each group of 4 adjacent i8 values and produce i32 results.
 #[target_feature(enable = "avx")]
 #[target_feature(enable = "avx2")]
 unsafe fn add_i8x32_i32x8(x: __m256i) -> __m256i {
     let one = _mm256_set1_epi8(1);
-    let tmp = _mm256_maddubs_epi16(one, x);
-    let one_i16 = _mm256_set1_epi16(1);
-    _mm256_madd_epi16(tmp, one_i16)
+    dot_u8i8x32_i32x4(_mm256_setzero_si256(), one, x)
 }
 
 /// Sum each group of 4 adjacent u8 values and produce i32 results.
@@ -90,9 +115,7 @@ unsafe fn add_i8x32_i32x8(x: __m256i) -> __m256i {
 #[target_feature(enable = "avx2")]
 unsafe fn add_u8x32_i32x8(x: __m256i) -> __m256i {
     let one = _mm256_set1_epi8(1);
-    let tmp = _mm256_maddubs_epi16(x, one);
-    let one_i16 = _mm256_set1_epi16(1);
-    _mm256_madd_epi16(tmp, one_i16)
+    dot_u8i8x32_i32x4(_mm256_setzero_si256(), x, one)
 }
 
 #[target_feature(enable = "avx")]
@@ -150,9 +173,9 @@ unsafe fn matmul_int(
         ),
     );
 
-    // Mask which is set for the first `MR` elements. This needs to
-    // be adjusted manually if `MR` is changed.
-    let mask = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
+    // Mask which is set for the first `MR` elements.
+    let mask_values: [i32; 8] = std::array::from_fn(|i| if i < MR { -1 } else { 0 });
+    let mask = _mm256_loadu_si256(mask_values.as_ptr() as *const __m256i);
 
     for col_block in 0..n_col_blocks {
         let b_off = col_block * n_depth_blocks * 8 * 4;
@@ -166,7 +189,6 @@ unsafe fn matmul_int(
             let mut b_sum = _mm256_setzero_si256();
 
             let mut tmp = [c_init; MR];
-            let one = _mm256_set1_epi16(1);
 
             for k_block in 0..n_depth_blocks {
                 let bv = _mm256_loadu_si256(
@@ -183,13 +205,11 @@ unsafe fn matmul_int(
 
                 for i in 0..MR {
                     let av = _mm256_broadcast_ss(std::mem::transmute::<*const u8, &f32>(
-                        a_ptr.add(a_off + k_block * size_of::<__m256i>() + i), // a_ptr.add((row_block * MR + i) * a_row_stride + k_block * 4),
+                        a_ptr.add(a_off + k_block * size_of::<__m256i>() + i),
                     ));
                     let av = std::mem::transmute::<__m256, __m256i>(av);
 
-                    let z = _mm256_maddubs_epi16(av, bv);
-                    let z = _mm256_madd_epi16(z, one);
-                    tmp[i] = _mm256_add_epi32(tmp[i], z);
+                    tmp[i] = dot_u8i8x32_i32x4(tmp[i], av, bv);
                 }
 
                 a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8(a_vals));
@@ -202,8 +222,7 @@ unsafe fn matmul_int(
             for i in 0..MR {
                 let c_off =
                     (row_block * row_block_size + i) * c_row_stride + (col_block * col_block_size);
-                let z = _mm256_loadu_si256(c_ptr.add(c_off) as *const __m256i);
-                let z = _mm256_add_epi32(tmp[i], z);
+                let z = tmp[i];
                 let z = _mm256_sub_epi32(z, b_sum);
                 let z = _mm256_sub_epi32(z, _mm256_set1_epi32(a_sums[i]));
                 _mm256_storeu_si256(c_ptr.add(c_off) as *mut __m256i, z);
@@ -293,29 +312,8 @@ fn to_array<T: Copy + Default, const N: usize>(x: __m256i) -> [T; N] {
     out
 }
 
-#[allow(unused)]
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn test_avx_funcs() {
-    let x = _mm256_set1_epi8(2);
-    let x = add_i8x32_i32x8(x);
-    let mut out = [0i32; 8];
-    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, x);
-    println!("add_i8x16_i32x4 {:?}", out);
-
-    let x = _mm256_set1_epi8(2);
-    let x = add_u8x32_i32x8(x);
-    let mut out = [0i32; 8];
-    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, x);
-    println!("add_u8x16_i32x4 {:?}", out);
-}
-
 fn main() {
-    // unsafe { test_avx_funcs() };
-    // // TESTING
-    // return;
-
-    let m = std::hint::black_box(6 * 100);
+    let m = std::hint::black_box(MR * 100);
     let n = std::hint::black_box(8 * 100);
     let k = std::hint::black_box(4 * 100);
 
@@ -324,11 +322,6 @@ fn main() {
     let mut c = vec![0i32; m * n];
     let a_zero_point = 5;
     let b_zero_point = -5;
-
-    // println!("A:");
-    // print_mat(&a, m, k);
-    // println!("\nB:");
-    // print_mat(&b, k, n);
 
     let mut packed_a = vec![0; m * k];
     let mut packed_b = vec![0; k * n];
@@ -340,6 +333,7 @@ fn main() {
         c.fill(0);
         pack_a(&mut packed_a, &a, m, k);
         pack_b(&mut packed_b, &b, k, n);
+
         unsafe {
             matmul_int(
                 &mut c,
