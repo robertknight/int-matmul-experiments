@@ -19,47 +19,52 @@ use std::arch::x86_64::{
 
 const MR: usize = 6;
 
-fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
+fn pack_b(out: &mut [i8], vals: &[i8], b_rows: usize, b_cols: usize) {
     assert!(b_cols % 8 == 0);
     assert!(b_cols % 4 == 0);
+    assert!(out.len() == b_rows * b_cols);
 
     let b_row_stride = b_cols;
+    let mut out_off = 0;
 
-    let mut out = Vec::new();
     for col_block in 0..b_cols / 8 {
         for row_block in 0..b_rows / 4 {
             for col_off in 0..8 {
                 for row_off in 0..4 {
                     let y = row_block * 4 + row_off;
                     let x = col_block * 8 + col_off;
-                    out.push(vals[y * b_row_stride + x]);
+                    unsafe {
+                        *out.get_unchecked_mut(out_off) = *vals.get_unchecked(y * b_row_stride + x);
+                        out_off += 1;
+                    }
                 }
             }
         }
     }
-    out
 }
 
-fn pack_a(vals: &[u8], a_rows: usize, a_cols: usize) -> Vec<u8> {
+fn pack_a(out: &mut [u8], vals: &[u8], a_rows: usize, a_cols: usize) {
     assert!(a_rows % MR == 0);
     assert!(a_cols % 4 == 0);
+    assert!(out.len() == a_rows * a_cols);
 
     let a_row_stride = a_cols;
+    let mut out_off = 0;
 
-    let mut out = Vec::new();
     for col_block in 0..a_cols / 4 {
         for row_block in 0..a_rows / MR {
             for row_off in 0..MR {
                 for col_off in 0..4 {
                     let y = row_block * MR + row_off;
                     let x = col_block * 4 + col_off;
-                    out.push(vals[y * a_row_stride + x]);
+                    unsafe {
+                        *out.get_unchecked_mut(out_off) = *vals.get_unchecked(y * a_row_stride + x);
+                        out_off += 1;
+                    }
                 }
             }
         }
     }
-
-    out
 }
 
 /// Sum each group of 4 adjacent i8 values and produce i32 results.
@@ -286,9 +291,9 @@ fn main() {
     // // TESTING
     // return;
 
-    let m = 6 * 100;
-    let n = 8 * 100;
-    let k = 4 * 100;
+    let m = std::hint::black_box(6 * 100);
+    let n = std::hint::black_box(8 * 100);
+    let k = std::hint::black_box(4 * 100);
 
     let a: Vec<u8> = (0..m * k).map(|x| x as u8).collect();
     let b: Vec<i8> = (0..k * n).map(|x| x as i8).collect();
@@ -301,14 +306,16 @@ fn main() {
     // println!("\nB:");
     // print_mat(&b, k, n);
 
-    let packed_a = pack_a(&a, m, k);
-    let packed_b = pack_b(&b, k, n);
+    let mut packed_a = vec![0; m * k];
+    let mut packed_b = vec![0; k * n];
 
     let start = std::time::Instant::now();
     let n_iters = 1000;
     for _ in 0..n_iters {
         // TODO - Fold this into `matmul_int` as a `beta` argument.
         c.fill(0);
+        pack_a(&mut packed_a, &a, m, k);
+        pack_b(&mut packed_b, &b, k, n);
         unsafe {
             matmul_int(
                 &mut c,
