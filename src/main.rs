@@ -1,6 +1,8 @@
 use std::arch::x86_64::{
-    __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_loadu_si256, _mm256_madd_epi16,
-    _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256,
+    __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_extract_epi32,
+    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mullo_epi32,
+    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_epi8, _mm256_setzero_si256,
+    _mm256_storeu_si256, _mm256_sub_epi32,
 };
 
 fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
@@ -24,9 +26,38 @@ fn pack_b(vals: &[i8], b_rows: usize, b_cols: usize) -> Vec<i8> {
     out
 }
 
+/// Sum each group of 4 adjacent i8 values and produce i32 results.
 #[target_feature(enable = "avx")]
 #[target_feature(enable = "avx2")]
-unsafe fn matmul_int(c: &mut [i32], a: &[u8], b: &[i8], m: usize, n: usize, k: usize) {
+unsafe fn add_i8x32_i32x8(x: __m256i) -> __m256i {
+    let one = _mm256_set1_epi8(1);
+    let tmp = _mm256_maddubs_epi16(one, x);
+    let one_i16 = _mm256_set1_epi16(1);
+    _mm256_madd_epi16(tmp, one_i16)
+}
+
+/// Sum each group of 4 adjacent u8 values and produce i32 results.
+#[target_feature(enable = "avx")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_u8x32_i32x8(x: __m256i) -> __m256i {
+    let one = _mm256_set1_epi8(1);
+    let tmp = _mm256_maddubs_epi16(x, one);
+    let one_i16 = _mm256_set1_epi16(1);
+    _mm256_madd_epi16(tmp, one_i16)
+}
+
+#[target_feature(enable = "avx")]
+#[target_feature(enable = "avx2")]
+unsafe fn matmul_int(
+    c: &mut [i32],
+    a: &[u8],
+    b: &[i8],
+    a_zero_point: u8,
+    b_zero_point: i8,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
     const MR: usize = 6;
     assert!(k % 4 == 0);
     assert!(m % MR == 0);
@@ -46,50 +77,134 @@ unsafe fn matmul_int(c: &mut [i32], a: &[u8], b: &[i8], m: usize, n: usize, k: u
     let a_row_stride = k;
     let c_row_stride = n;
 
+    // The value for each output cell is computed as:
+    //
+    // c = (a[0] - a_zero_point) * (b[0] - b_zero_point) + ...
+    //   = a[0]b[0] - a[0] * b_zero_point - b[0] * a_zero_point + a_zero_point * b_zero_point
+    //   = dot(a, b) - sum(a) * b_zero_point - sum(b) * a_zero_point + len(a) * a_zero_point * b_zero_point
+    let c_init = _mm256_mullo_epi32(
+        _mm256_set1_epi32(k as i32),
+        _mm256_mullo_epi32(
+            _mm256_set1_epi32(a_zero_point as i32),
+            _mm256_set1_epi32(b_zero_point as i32),
+        ),
+    );
+
     for col_block in 0..n_col_blocks {
         let b_off = col_block * n_depth_blocks * 8 * 4;
 
         for row_block in 0..n_row_blocks {
-            let mut tmp = [_mm256_setzero_si256(); MR];
+            // Sums along each row of `a`.
+            let mut a_sum = _mm256_setzero_si256();
+            // Sums along each column of `b`.
+            let mut b_sum = _mm256_setzero_si256();
+
+            let mut tmp = [c_init; MR];
             let one = _mm256_set1_epi16(1);
             for k_block in 0..n_depth_blocks {
                 let bv = _mm256_loadu_si256(
                     b_ptr.add(b_off + k_block * size_of::<__m256i>()) as *const __m256i
                 );
+                b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8(bv));
+
+                // An MR * 4 slice of A.
+                let mut a_vals = [0i32; 8];
+
                 for i in 0..MR {
                     let av = _mm256_broadcast_ss(std::mem::transmute::<*const u8, &f32>(
                         a_ptr.add((row_block * MR + i) * a_row_stride + k_block * 4),
                     ));
                     let av = std::mem::transmute::<__m256, __m256i>(av);
 
+                    a_vals[i] = _mm256_extract_epi32(av, 0);
+
                     let z = _mm256_maddubs_epi16(av, bv);
                     let z = _mm256_madd_epi16(z, one);
                     tmp[i] = _mm256_add_epi32(tmp[i], z);
                 }
+
+                let a_col = _mm256_loadu_si256(a_vals.as_ptr() as *const __m256i);
+                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8(a_col));
             }
+
+            let a_sum = _mm256_mullo_epi32(a_sum, _mm256_set1_epi32(b_zero_point as i32));
+            let a_sums = to_array::<i32, 8>(a_sum);
+            let b_sum = _mm256_mullo_epi32(b_sum, _mm256_set1_epi32(a_zero_point as i32));
+
             for i in 0..MR {
                 let c_off =
                     (row_block * row_block_size + i) * c_row_stride + (col_block * col_block_size);
                 let z = _mm256_loadu_si256(c_ptr.add(c_off) as *const __m256i);
                 let z = _mm256_add_epi32(tmp[i], z);
+                let z = _mm256_sub_epi32(z, b_sum);
+                let z = _mm256_sub_epi32(z, _mm256_set1_epi32(a_sums[i]));
                 _mm256_storeu_si256(c_ptr.add(c_off) as *mut __m256i, z);
             }
         }
     }
 }
 
-fn reference_matmul_int(a: &[u8], b: &[i8], m: usize, n: usize, k: usize) -> Vec<i32> {
+#[allow(unused)]
+fn reference_matmul_int(
+    a: &[u8],
+    b: &[i8],
+    a_zero_point: u8,
+    b_zero_point: i8,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<i32> {
     let mut out = vec![0; m * n];
     for row in 0..m {
         for col in 0..n {
             for depth in 0..k {
-                out[row * n + col] += a[row * k + depth] as i32 * b[depth * n + col] as i32;
+                let a_val = a[row * k + depth] as i32 - a_zero_point as i32;
+                let b_val = b[depth * n + col] as i32 - b_zero_point as i32;
+                out[row * n + col] += a_val * b_val;
             }
         }
     }
     out
 }
 
+/// Variant of `reference_matmul_int` where the zero-point handling has been
+/// optimized to more closely match the way it is handled in the real
+/// implementation.
+#[allow(unused)]
+fn reference_matmul_int_opt_zp(
+    a: &[u8],
+    b: &[i8],
+    a_zero_point: u8,
+    b_zero_point: i8,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<i32> {
+    let mut out = vec![0; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0;
+            let mut a_sum = 0;
+            let mut b_sum = 0;
+
+            for depth in 0..k {
+                let a_val = a[row * k + depth] as i32;
+                let b_val = b[depth * n + col] as i32;
+                a_sum += a_val;
+                b_sum += b_val;
+                acc += a_val * b_val;
+            }
+
+            acc = acc - (a_sum * b_zero_point as i32) - (b_sum * a_zero_point as i32)
+                + (k as i32 * a_zero_point as i32 * b_zero_point as i32);
+
+            out[row * n + col] += acc;
+        }
+    }
+    out
+}
+
+#[allow(unused)]
 fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     for row in 0..m {
         for col in 0..n {
@@ -99,21 +214,60 @@ fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     }
 }
 
+fn to_array<T: Copy + Default, const N: usize>(x: __m256i) -> [T; N] {
+    assert_eq!(size_of::<T>() * N, size_of::<__m256i>());
+    let mut out = [T::default(); N];
+    unsafe {
+        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, x);
+    }
+    out
+}
+
+#[allow(unused)]
+#[target_feature(enable = "avx")]
+#[target_feature(enable = "avx2")]
+unsafe fn test_avx_funcs() {
+    let x = _mm256_set1_epi8(2);
+    let x = add_i8x32_i32x8(x);
+    let mut out = [0i32; 8];
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, x);
+    println!("add_i8x16_i32x4 {:?}", out);
+
+    let x = _mm256_set1_epi8(2);
+    let x = add_u8x32_i32x8(x);
+    let mut out = [0i32; 8];
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, x);
+    println!("add_u8x16_i32x4 {:?}", out);
+}
+
 fn main() {
-    let m = 6 * 2;
-    let n = 8 * 2;
-    let k = 4 * 2;
+    // unsafe { test_avx_funcs() };
+    // // TESTING
+    // return;
+
+    let m = 6 * 100;
+    let n = 8 * 100;
+    let k = 4 * 100;
 
     let a: Vec<u8> = (0..m * k).map(|x| x as u8).collect();
     let b: Vec<i8> = (0..k * n).map(|x| x as i8).collect();
     let mut c = vec![0i32; m * n];
+    let a_zero_point = 5;
+    let b_zero_point = -5;
+
+    // println!("A:");
+    // print_mat(&a, m, k);
+    // println!("\nB:");
+    // print_mat(&b, k, n);
 
     let packed_b = pack_b(&b, k, n);
 
     let start = std::time::Instant::now();
-    let n_iters = 1;
+    let n_iters = 1000;
     for _ in 0..n_iters {
-        unsafe { matmul_int(&mut c, &a, &packed_b, m, n, k) };
+        // TODO - Fold this into `matmul_int` as a `beta` argument.
+        c.fill(0);
+        unsafe { matmul_int(&mut c, &a, &packed_b, a_zero_point, b_zero_point, m, n, k) };
     }
 
     let duration = start.elapsed();
@@ -126,12 +280,17 @@ fn main() {
         m, n, k, duration_ms, gflops,
     );
 
-    let ref_c = reference_matmul_int(&a, &b, m, n, k);
+    // let ref_c = reference_matmul_int(&a, &b, a_zero_point, b_zero_point, m, n, k);
+    // let ref_c_opt = reference_matmul_int_opt_zp(&a, &b, a_zero_point, b_zero_point, m, n, k);
 
-    println!("\n\nOptimized:");
-    print_mat(&c, m, n);
+    // println!("\nOptimized:");
+    // print_mat(&c, m, n);
 
-    println!("");
-    println!("Reference:");
-    print_mat(&ref_c, m, n);
+    // println!("");
+    // println!("Reference:");
+    // print_mat(&ref_c, m, n);
+
+    // println!("");
+    // println!("Reference (optimized zero-point):");
+    // print_mat(&ref_c_opt, m, n);
 }
