@@ -19,6 +19,10 @@ use std::arch::x86_64::{
 
 const MR: usize = 6;
 
+// Pack blocks of the B matrix for use by the matmul kernel.
+//
+// Pack B matrix of shape `[K, N]` into a layout with shape `[N / 8, K / 4, 8,
+// 4]`.
 fn pack_b(out: &mut [i8], vals: &[i8], b_rows: usize, b_cols: usize) {
     assert!(b_cols % 8 == 0);
     assert!(b_cols % 4 == 0);
@@ -43,6 +47,10 @@ fn pack_b(out: &mut [i8], vals: &[i8], b_rows: usize, b_cols: usize) {
     }
 }
 
+// Pack blocks of the A matrix for use by the matmul kernel.
+//
+// Pack A matrix of shape `[M, K]` into a layout with shape `[K / 4, M / MR, MR,
+// 4]`.
 fn pack_a(out: &mut [u8], vals: &[u8], a_rows: usize, a_cols: usize) {
     assert!(a_rows % MR == 0);
     assert!(a_cols % 4 == 0);
@@ -120,8 +128,20 @@ unsafe fn matmul_int(
     // The value for each output cell is computed as:
     //
     // c = (a[0] - a_zero_point) * (b[0] - b_zero_point) + ...
-    //   = a[0]b[0] - a[0] * b_zero_point - b[0] * a_zero_point + a_zero_point * b_zero_point
-    //   = dot(a, b) - sum(a) * b_zero_point - sum(b) * a_zero_point + len(a) * a_zero_point * b_zero_point
+    //
+    // This can be expanded and re-arranged into:
+    //
+    // c = a[0]b[0] - a[0] * b_zero_point - b[0] * a_zero_point + a_zero_point * b_zero_point + ...
+    // c = dot(a, b) - sum(a) * b_zero_point - sum(b) * a_zero_point + ... + len(a) * a_zero_point * b_zero_point
+    //
+    // The final term of the above equation does not depend on any individual
+    // elements, so is pre-computed and used as the initialization value for
+    // each output tile. Note that this assumes a single zero-point value per
+    // tensor.
+    //
+    // The accumulation of the sum of each row of a and each column of b are
+    // interleaved with the dot product and subtracted from the temporary `c`
+    // value at the end.
     let c_init = _mm256_mullo_epi32(
         _mm256_set1_epi32(k as i32),
         _mm256_mullo_epi32(
@@ -129,6 +149,10 @@ unsafe fn matmul_int(
             _mm256_set1_epi32(b_zero_point as i32),
         ),
     );
+
+    // Mask which is set for the first `MR` elements. This needs to
+    // be adjusted manually if `MR` is changed.
+    let mask = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
 
     for col_block in 0..n_col_blocks {
         let b_off = col_block * n_depth_blocks * 8 * 4;
@@ -143,8 +167,6 @@ unsafe fn matmul_int(
 
             let mut tmp = [c_init; MR];
             let one = _mm256_set1_epi16(1);
-
-            let mask = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
 
             for k_block in 0..n_depth_blocks {
                 let bv = _mm256_loadu_si256(
@@ -250,6 +272,7 @@ fn reference_matmul_int_opt_zp(
     out
 }
 
+/// Print the values of a matrix.
 #[allow(unused)]
 fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     for row in 0..m {
@@ -260,6 +283,7 @@ fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     }
 }
 
+/// Convert a SIMD vector into a `[T; N]` array.
 fn to_array<T: Copy + Default, const N: usize>(x: __m256i) -> [T; N] {
     assert_eq!(size_of::<T>() * N, size_of::<__m256i>());
     let mut out = [T::default(); N];
