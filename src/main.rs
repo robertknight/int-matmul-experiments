@@ -280,7 +280,14 @@ fn main() {
         m, n, k, duration_ms, gflops,
     );
 
-    // let ref_c = reference_matmul_int(&a, &b, a_zero_point, b_zero_point, m, n, k);
+    let ref_c = reference_matmul_int(&a, &b, a_zero_point, b_zero_point, m, n, k);
+
+    if c != ref_c {
+        println!("Reference and optimized implementations match.");
+    } else {
+        println!("Reference and optimized implementations DO NOT MATCH.");
+    }
+
     // let ref_c_opt = reference_matmul_int_opt_zp(&a, &b, a_zero_point, b_zero_point, m, n, k);
 
     // println!("\nOptimized:");
