@@ -2,27 +2,22 @@ use crate::Kernel;
 
 use std::arch::asm;
 use std::arch::x86_64::{
-    __m256,
-    __m256i,
-    _mm256_add_epi32,
-    _mm256_broadcast_ss, //_mm256_extract_epi32,
-    _mm256_loadu_si256,
-    _mm256_madd_epi16,
-    _mm256_maddubs_epi16,
-    _mm256_maskload_epi32,
-    _mm256_mullo_epi32,
-    _mm256_set1_epi16,
-    _mm256_set1_epi32,
-    _mm256_set1_epi8,
-    _mm256_setzero_si256,
-    _mm256_storeu_si256,
+    __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_loadu_si256, _mm256_madd_epi16,
+    _mm256_maddubs_epi16, _mm256_maskload_epi32, _mm256_mullo_epi32, _mm256_set1_epi16,
+    _mm256_set1_epi32, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_storeu_si256,
     _mm256_sub_epi32,
 };
 
-/// Whether to use AVX-VNNI instructions. This improves performance by
-/// performing u8 x i8 -> i32 dot products with one instruction instead of
-/// three.
-const USE_VNNI: bool = false;
+const VNNI_NONE: u8 = 0;
+const VNNI_AVX: u8 = 1;
+const VNNI_AVX_512: u8 = 2;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum VnniType {
+    None,
+    Avx,
+    Avx512,
+}
 
 /// Number of rows in tiles used by microkernel. Empirically 7 is the maximum
 /// value for the current implementation and performance drops a lot with
@@ -43,10 +38,25 @@ fn to_array<T: Copy + Default, const N: usize>(x: __m256i) -> [T; N] {
 
 #[target_feature(enable = "avx")]
 #[target_feature(enable = "avx2")]
-unsafe fn dot_u8i8x32_i32x4(mut out: __m256i, x: __m256i, y: __m256i) -> __m256i {
-    if USE_VNNI {
+unsafe fn dot_u8i8x32_i32x4<const VNNI_TYPE: u8>(
+    mut out: __m256i,
+    x: __m256i,
+    y: __m256i,
+) -> __m256i {
+    if VNNI_TYPE == VNNI_AVX_512 {
+        // This uses AVX-512 VNNI (EVEX-encoded) rather than AVX-VNNI
+        // (VEX-encoded).
         asm! {
             "vpdpbusd {result}, {x}, {y}",
+            result = inout(ymm_reg) out,
+            x = in(ymm_reg) x,
+            y = in(ymm_reg) y,
+            options(nostack)
+        }
+        out
+    } else if VNNI_TYPE == VNNI_AVX {
+        asm! {
+            "{{vex}} vpdpbusd {result}, {x}, {y}",
             result = inout(ymm_reg) out,
             x = in(ymm_reg) x,
             y = in(ymm_reg) y,
@@ -63,22 +73,22 @@ unsafe fn dot_u8i8x32_i32x4(mut out: __m256i, x: __m256i, y: __m256i) -> __m256i
 /// Sum each group of 4 adjacent i8 values and produce i32 results.
 #[target_feature(enable = "avx")]
 #[target_feature(enable = "avx2")]
-unsafe fn add_i8x32_i32x8(x: __m256i) -> __m256i {
+unsafe fn add_i8x32_i32x8<const VNNI_TYPE: u8>(x: __m256i) -> __m256i {
     let one = _mm256_set1_epi8(1);
-    dot_u8i8x32_i32x4(_mm256_setzero_si256(), one, x)
+    dot_u8i8x32_i32x4::<VNNI_TYPE>(_mm256_setzero_si256(), one, x)
 }
 
 /// Sum each group of 4 adjacent u8 values and produce i32 results.
 #[target_feature(enable = "avx")]
 #[target_feature(enable = "avx2")]
-unsafe fn add_u8x32_i32x8(x: __m256i) -> __m256i {
+unsafe fn add_u8x32_i32x8<const VNNI_TYPE: u8>(x: __m256i) -> __m256i {
     let one = _mm256_set1_epi8(1);
-    dot_u8i8x32_i32x4(_mm256_setzero_si256(), x, one)
+    dot_u8i8x32_i32x4::<VNNI_TYPE>(_mm256_setzero_si256(), x, one)
 }
 
 #[target_feature(enable = "avx")]
 #[target_feature(enable = "avx2")]
-unsafe fn matmul_int(
+unsafe fn matmul_int<const VNNI_TYPE: u8>(
     c: &mut [i32],
     a: &[u8],
     b: &[i8],
@@ -152,10 +162,8 @@ unsafe fn matmul_int(
                 let bv = _mm256_loadu_si256(
                     b_ptr.add(b_off + k_block * size_of::<__m256i>()) as *const __m256i
                 );
-                b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8(bv));
+                b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8::<VNNI_TYPE>(bv));
 
-                // An MR * 4 slice of A.
-                // let mut a_vals = [0i32; 8];
                 let a_vals = _mm256_maskload_epi32(
                     a_ptr.add(a_off + k_block * size_of::<__m256i>()) as *const i32,
                     mask,
@@ -167,16 +175,16 @@ unsafe fn matmul_int(
                     ));
                     let av = std::mem::transmute::<__m256, __m256i>(av);
 
-                    tmp[i] = dot_u8i8x32_i32x4(tmp[i], av, bv);
+                    tmp[i] = dot_u8i8x32_i32x4::<VNNI_TYPE>(tmp[i], av, bv);
                 }
 
-                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8(a_vals));
+                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8::<VNNI_TYPE>(a_vals));
             }
 
             let a_sum = _mm256_mullo_epi32(a_sum, _mm256_set1_epi32(b_zero_point as i32));
-            let a_sums = to_array::<i32, 8>(a_sum);
             let b_sum = _mm256_mullo_epi32(b_sum, _mm256_set1_epi32(a_zero_point as i32));
 
+            let a_sums = to_array::<i32, 8>(a_sum);
             for i in 0..MR {
                 let c_off =
                     (row_block * row_block_size + i) * c_row_stride + (col_block * col_block_size);
@@ -189,14 +197,23 @@ unsafe fn matmul_int(
     }
 }
 
-pub struct AvxKernel {}
+pub struct AvxKernel {
+    vnni: VnniType,
+}
 
 unsafe impl Kernel for AvxKernel {
     fn new() -> Option<Self> {
         if !is_x86_feature_detected!("avx2") {
             return None;
         }
-        Some(AvxKernel {})
+
+        let vnni = if is_avx512_supported() {
+            VnniType::Avx512
+        } else {
+            VnniType::None
+        };
+
+        Some(AvxKernel { vnni })
     }
 
     /// Return number of rows in this kernel's microtile.
@@ -240,6 +257,84 @@ unsafe impl Kernel for AvxKernel {
         n: usize,
         k: usize,
     ) {
-        unsafe { matmul_int(c, a, b, a_zero_point, b_zero_point, m, n, k) }
+        match self.vnni {
+            VnniType::Avx512 => {
+                // Safety: AVX2 and AVX512-VNNI are supported.
+                unsafe { matmul_int::<VNNI_AVX_512>(c, a, b, a_zero_point, b_zero_point, m, n, k) }
+            }
+            VnniType::Avx => {
+                // Safety: AVX2 and AVX-VNNI are supported.
+                unsafe { matmul_int::<VNNI_AVX>(c, a, b, a_zero_point, b_zero_point, m, n, k) }
+            }
+            VnniType::None => {
+                // Safety: AVX2 is supported.
+                unsafe { matmul_int::<VNNI_NONE>(c, a, b, a_zero_point, b_zero_point, m, n, k) }
+            }
+        }
+    }
+}
+
+/// Detect availability of AVX-512 on macOS, where `is_x86_feature_detected`
+/// can return false even if AVX-512 is available.
+///
+/// See https://github.com/golang/go/issues/43089. Go chose to use the
+/// `commpage` to get the info. We use `sysctlbyname` instead since it is
+/// a documented API.
+#[cfg(target_os = "macos")]
+fn test_for_avx512_on_macos() -> bool {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::sync::OnceLock;
+
+    #[link(name = "c")]
+    extern "C" {
+        /// See https://developer.apple.com/documentation/kernel/1387446-sysctlbyname.
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *const c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+
+    static AVX512_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+    *AVX512_AVAILABLE.get_or_init(|| {
+        unsafe {
+            let mut ret = 0u64;
+            let mut size = std::mem::size_of::<u64>();
+
+            // We test only for avx512vl, as this implies avx512f.
+            let sysctl_ret = sysctlbyname(
+                CStr::from_bytes_with_nul(b"hw.optional.avx512vl\0")
+                    .unwrap()
+                    .as_ptr(),
+                std::mem::transmute(&mut ret),
+                &mut size,
+                std::ptr::null(),
+                0,
+            );
+            sysctl_ret == 0 && ret == 1
+        }
+    })
+}
+
+/// Test if the current system has basic AVX-512 support (AVX-512 F, AVX-512 VL).
+///
+/// This is unfortunately not as simple as using `is_x86_feature_detected`
+/// because that can return incorrect results on macOS.
+fn is_avx512_supported() -> bool {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl") {
+        true
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            test_for_avx512_on_macos()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 }
