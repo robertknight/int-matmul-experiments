@@ -1,5 +1,14 @@
+#![cfg_attr(
+    feature = "avx512",
+    feature(stdarch_x86_avx512),
+    feature(avx512_target_feature)
+)]
+
 mod arch;
 mod packing;
+
+#[allow(unused_imports)]
+use arch::KernelHint;
 
 /// Trait implemented by integer matmul kernels.
 ///
@@ -12,6 +21,8 @@ unsafe trait Kernel {
     fn new() -> Option<Self>
     where
         Self: Sized;
+
+    fn name(&self) -> &str;
 
     /// Return number of rows in this kernel's microtile.
     fn mr(&self) -> usize;
@@ -117,10 +128,35 @@ fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     }
 }
 
-fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
-    let m = std::hint::black_box(kernel.mr() * scale);
-    let n = std::hint::black_box(kernel.nr() * scale);
-    let k = std::hint::black_box(4 * scale);
+#[derive(Copy, Clone, Debug)]
+struct InputScale {
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+impl InputScale {
+    #[allow(unused)]
+    fn uniform(scale: usize) -> Self {
+        InputScale {
+            m: scale,
+            n: scale,
+            k: scale,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+enum ErrorDetail {
+    Short,
+    Verbose,
+}
+
+fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale, detail: ErrorDetail) {
+    let m = std::hint::black_box(kernel.mr() * scale.m);
+    let n = std::hint::black_box(kernel.nr() * scale.n);
+    let k = std::hint::black_box(4 * scale.k);
 
     let a: Vec<u8> = (0..m * k).map(|x| x as u8).collect();
     let b: Vec<i8> = (0..k * n).map(|x| x as i8).collect();
@@ -133,6 +169,7 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 
     let start = std::time::Instant::now();
     for _ in 0..n_iters {
+        c.fill(0);
         kernel.pack_a(&mut packed_a, &a, m, k);
         kernel.pack_b(&mut packed_b, &b, k, n);
         kernel.matmul(
@@ -159,18 +196,37 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 
     let ref_c = reference_matmul_int(&a, &b, a_zero_point, b_zero_point, m, n, k);
 
-    if c != ref_c {
+    if c == ref_c {
         println!("Reference and optimized implementations match.");
     } else {
         println!("Reference and optimized implementations DO NOT MATCH.");
+
+        if detail == ErrorDetail::Verbose {
+            println!("\nActual:\n");
+            print_mat(&c, m, n);
+
+            println!("\nExpected:\n");
+            print_mat(&ref_c, m, n);
+        }
     }
 }
 
 fn main() {
-    let kernel = arch::new_kernel();
-    test_kernel(
-        kernel.as_ref(),
-        1_000, /* n_iters */
-        100,   /* scale */
-    );
+    let kernel = arch::new_kernel(None);
+    println!("Kernel: {}", kernel.name());
+
+    // Do a functional test with scale factor >1 in each dimension.
+    let n_iters = 1;
+    let scale = InputScale { m: 3, n: 3, k: 3 };
+    test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Verbose);
+
+    // Do a benchmark
+    #[cfg(not(debug_assertions))]
+    {
+        // let n_iters = 500;
+        // let scale = InputScale::uniform(100);
+        let n_iters = 500;
+        let scale = InputScale::uniform(100);
+        test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Short);
+    }
 }
