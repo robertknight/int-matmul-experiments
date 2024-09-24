@@ -1,3 +1,7 @@
+#![cfg(feature = "avx512")]
+#![feature(stdarch_x86_avx512)]
+#![feature(avx512_target_feature)]
+
 mod arch;
 mod packing;
 
@@ -171,6 +175,6 @@ fn main() {
     test_kernel(
         kernel.as_ref(),
         1_000, /* n_iters */
-        100,   /* scale */
+        50,    /* scale */
     );
 }
