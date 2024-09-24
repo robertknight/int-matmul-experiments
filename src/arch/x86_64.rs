@@ -2,10 +2,10 @@ use crate::Kernel;
 
 use std::arch::asm;
 use std::arch::x86_64::{
-    __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_loadu_si256, _mm256_madd_epi16,
-    _mm256_maddubs_epi16, _mm256_maskload_epi32, _mm256_mullo_epi32, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_storeu_si256,
-    _mm256_sub_epi32,
+    __cpuid_count, __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_loadu_si256,
+    _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_maskload_epi32, _mm256_mullo_epi32,
+    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_epi8, _mm256_setzero_si256,
+    _mm256_storeu_si256, _mm256_sub_epi32,
 };
 
 const VNNI_NONE: u8 = 0;
@@ -197,6 +197,32 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
     }
 }
 
+struct VnniInfo {
+    avx512_vnni: bool,
+    avx_vnni: bool,
+}
+
+/// Detect availability of VNNI instructions.
+///
+/// See https://www.felixcloutier.com/x86/cpuid or the Intel Instruction Set
+/// Reference for cpuid.
+fn detect_vnni() -> VnniInfo {
+    let avx512_vnni = if is_avx512_supported() {
+        let regs = unsafe { __cpuid_count(7, 0) };
+        regs.ecx & (1 << 11) != 0
+    } else {
+        false
+    };
+
+    let regs = unsafe { __cpuid_count(7, 1) };
+    let avx_vnni = regs.eax & (1 << 4) != 0;
+
+    VnniInfo {
+        avx512_vnni,
+        avx_vnni,
+    }
+}
+
 pub struct AvxKernel {
     vnni: VnniType,
 }
@@ -207,10 +233,21 @@ unsafe impl Kernel for AvxKernel {
             return None;
         }
 
-        let vnni = if is_avx512_supported() {
-            VnniType::Avx512
-        } else {
-            VnniType::None
+        // CPUs may have only AVX512 VNNI, only AVX VNNI or both.
+        //
+        // Since this is an AVX2 kernel we prefer AVX VNNI, but will use
+        // AVX512-VNNI if that is the only option. Ideally AVX512-VNNI would
+        // be used in the context of an AVX512 kernel, but AVX512 intrinsics
+        // are not available in stable Rust. We can however use AVX512-VNNI via
+        // inline assembly with ymm registers.
+        let vnni_info = detect_vnni();
+        let vnni = match vnni_info {
+            VnniInfo { avx_vnni: true, .. } => VnniType::Avx,
+            VnniInfo {
+                avx512_vnni: true,
+                avx_vnni: false,
+            } => VnniType::Avx512,
+            _ => VnniType::None,
         };
 
         Some(AvxKernel { vnni })
