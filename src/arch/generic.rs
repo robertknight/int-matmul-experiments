@@ -23,7 +23,7 @@ fn matmul_int(
     let row_block_size = MR;
     let depth_block_size = 4;
     let n_col_blocks = n / col_block_size;
-    let n_row_blocks = m / MR;
+    let n_row_blocks = m / row_block_size;
     let n_depth_blocks = k / depth_block_size;
     let c_row_stride = n;
 
@@ -31,7 +31,7 @@ fn matmul_int(
     let a_ptr = a.as_ptr();
     let c_ptr = c.as_mut_ptr();
 
-    let c_init = [k as i32 * (a_zero_point as i32) * (b_zero_point as i32); NVEC];
+    let c_init = [k as i32 * (a_zero_point as i32) * (b_zero_point as i32); NR];
 
     for col_block in 0..n_col_blocks {
         let b_off = col_block * n_depth_blocks * NR * 4;
@@ -44,8 +44,8 @@ fn matmul_int(
             let mut tmp = [c_init; MR];
 
             for k_block in 0..n_depth_blocks {
-                let a_off = a_off + k_block * NVEC_I8;
-                let b_off = b_off + k_block * NVEC_I8;
+                let a_off = a_off + k_block * MR * 4;
+                let b_off = b_off + k_block * NR * 4;
 
                 for i in 0..MR {
                     for j in 0..NR {
@@ -76,10 +76,8 @@ fn matmul_int(
             for i in 0..MR {
                 let c_off =
                     (row_block * row_block_size + i) * c_row_stride + (col_block * col_block_size);
-                for j in 0..NVEC {
-                    tmp[i][j] -= b_sum[j];
-                    tmp[i][j] -= a_sum[i];
-                    unsafe { *c_ptr.add(c_off + j) = tmp[i][j] };
+                for j in 0..NR {
+                    unsafe { *c_ptr.add(c_off + j) = tmp[i][j] - b_sum[j] - a_sum[i] };
                 }
             }
         }

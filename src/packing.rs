@@ -30,7 +30,7 @@ pub fn pack_b<const NR: usize>(out: &mut [i8], vals: &[i8], b_rows: usize, b_col
 
 // Pack blocks of the A matrix for use by the matmul kernel.
 //
-// Pack A matrix of shape `[M, K]` into a layout with shape `[K / 4, M / MR, MR,
+// Pack A matrix of shape `[M, K]` into a layout with shape `[M / MR, K / 4, MR,
 // 4]`.
 pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_cols: usize) {
     assert!(a_rows % MR == 0);
@@ -40,8 +40,8 @@ pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_col
     let a_row_stride = a_cols;
     let mut out_off = 0;
 
-    for col_block in 0..a_cols / 4 {
-        for row_block in 0..a_rows / MR {
+    for row_block in 0..a_rows / MR {
+        for col_block in 0..a_cols / 4 {
             for row_off in 0..MR {
                 for col_off in 0..4 {
                     let y = row_block * MR + row_off;
