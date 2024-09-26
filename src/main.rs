@@ -177,7 +177,7 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 fn main() {
     let kernel = arch::new_kernel(Some(KernelHint::Generic));
     let n_iters = 1000;
-    let scale = 50;
+    let scale = 100;
 
     // let n_iters = 1;
     // let scale = 20;

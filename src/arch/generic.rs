@@ -5,22 +5,6 @@ const NR: usize = 4;
 const NVEC: usize = 4;
 const NVEC_I8: usize = 16;
 
-fn add_i8x16_i32x4(x: [i8; 16]) -> [i32; 4] {
-    let y: [i16; 8] = std::array::from_fn(|i| x[i * 2] as i16 * x[i * 2 + 1] as i16);
-    std::array::from_fn(|i| y[i * 2] as i32 + y[i * 2 + 1] as i32)
-}
-
-fn add_u8x16_i32x4(x: [u8; 16]) -> [i32; 4] {
-    let y: [u16; 8] = std::array::from_fn(|i| x[i * 2] as u16 * x[i * 2 + 1] as u16);
-    std::array::from_fn(|i| y[i * 2] as i32 + y[i * 2 + 1] as i32)
-}
-
-fn dot_u8i8x16_i32x4(c: [i32; 4], a: [u8; 16], b: [i8; 16]) -> [i32; 4] {
-    let y: [i16; 8] = std::array::from_fn(|i| a[i * 2] as i16 * b[i * 2 + 1] as i16);
-    let y: [i32; 4] = std::array::from_fn(|i| y[i * 2] as i32 + y[i * 2 + 1] as i32);
-    std::array::from_fn(|i| c[i] + y[i])
-}
-
 fn matmul_int(
     c: &mut [i32],
     a: &[u8],
@@ -55,31 +39,30 @@ fn matmul_int(
         for row_block in 0..n_row_blocks {
             let a_off = row_block * n_depth_blocks * MR * 4;
 
-            let mut a_sum = [0; MR];
-            let mut b_sum = [0; NR];
-
+            let mut a_sum = [0i32; MR];
+            let mut b_sum = [0i32; NR];
             let mut tmp = [c_init; MR];
 
             for k_block in 0..n_depth_blocks {
-                let bv: [i8; 16] =
-                    std::array::from_fn(|i| unsafe { *b_ptr.add(b_off + k_block * NVEC_I8 + i) });
-                let bv_sum = add_i8x16_i32x4(bv);
-                for i in 0..NR {
-                    b_sum[i] += bv_sum[i];
-                }
-
-                let a_vals: [u8; MR * 4] = std::array::from_fn(|i| unsafe {
-                    *a_ptr.add(a_off + k_block * NVEC_I8 + i * 4)
-                });
+                let a_off = a_off + k_block * NVEC_I8;
+                let b_off = b_off + k_block * NVEC_I8;
 
                 for i in 0..MR {
-                    let av: [u8; 16] = std::array::from_fn(|j| a_vals[i * 4 + j % 4]);
-                    tmp[i] = dot_u8i8x16_i32x4(tmp[i], av, bv);
-                }
-
-                let av_sum = add_u8x16_i32x4(a_vals);
-                for i in 0..MR {
-                    a_sum[i] += av_sum[i];
+                    for j in 0..NR {
+                        let mut acc = 0;
+                        for k in 0..4 {
+                            let a_el = unsafe { *a_ptr.add(a_off + k) };
+                            let b_el = unsafe { *b_ptr.add(b_off + k) };
+                            if j == 0 {
+                                a_sum[i] += a_el as i32;
+                            }
+                            if i == 0 {
+                                b_sum[j] += b_el as i32;
+                            }
+                            acc += a_el as i32 * b_el as i32;
+                        }
+                        tmp[i][j] = acc;
+                    }
                 }
             }
 
