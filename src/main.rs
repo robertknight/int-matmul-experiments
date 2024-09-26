@@ -182,7 +182,7 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 }
 
 fn main() {
-    let kernel = arch::new_kernel(Some(KernelHint::Avx));
+    let kernel = arch::new_kernel(Some(KernelHint::Generic));
     let n_iters = 1;
     let scale = 1;
 

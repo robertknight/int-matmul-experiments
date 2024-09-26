@@ -51,8 +51,8 @@ fn matmul_int(
                     for j in 0..NR {
                         let mut acc = 0;
                         for k in 0..4 {
-                            let a_el = unsafe { *a_ptr.add(a_off + k) };
-                            let b_el = unsafe { *b_ptr.add(b_off + k) };
+                            let a_el = unsafe { *a_ptr.add(a_off + i * 4 + k) };
+                            let b_el = unsafe { *b_ptr.add(b_off + j * 4 + k) };
                             if j == 0 {
                                 a_sum[i] += a_el as i32;
                             }
@@ -61,7 +61,7 @@ fn matmul_int(
                             }
                             acc += a_el as i32 * b_el as i32;
                         }
-                        tmp[i][j] = acc;
+                        tmp[i][j] += acc;
                     }
                 }
             }
