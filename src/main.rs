@@ -7,6 +7,8 @@
 mod arch;
 mod packing;
 
+use arch::KernelHint;
+
 /// Trait implemented by integer matmul kernels.
 ///
 /// # Safety
@@ -173,10 +175,12 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 }
 
 fn main() {
-    let kernel = arch::new_kernel();
-    test_kernel(
-        kernel.as_ref(),
-        1_000, /* n_iters */
-        50,    /* scale */
-    );
+    let kernel = arch::new_kernel(Some(KernelHint::Generic));
+    let n_iters = 1000;
+    let scale = 50;
+
+    // let n_iters = 1;
+    // let scale = 20;
+
+    test_kernel(kernel.as_ref(), n_iters, scale);
 }
