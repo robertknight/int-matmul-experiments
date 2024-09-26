@@ -169,7 +169,6 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale, detail: E
 
     let start = std::time::Instant::now();
     for _ in 0..n_iters {
-        c.fill(0);
         kernel.pack_a(&mut packed_a, &a, m, k);
         kernel.pack_b(&mut packed_b, &b, k, n);
         kernel.matmul(
