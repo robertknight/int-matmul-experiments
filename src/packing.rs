@@ -1,7 +1,9 @@
 // Pack blocks of the B matrix for use by the matmul kernel.
 //
 // Pack B matrix of shape `[K, N]` into a layout with shape `[N / NR, K / 4, NR,
-// 4]`.
+// 4]`. The last two dimensions are transposed. In the kernel a transposed `[NR,
+// 4]` microtile of `B` is then multiplied with a `[MR, 4]` microtile of `A`
+// using dot product instructions.
 pub fn pack_b<const NR: usize>(out: &mut [i8], vals: &[i8], b_rows: usize, b_cols: usize) {
     assert!(b_cols % 8 == 0);
     assert!(b_cols % 4 == 0);
