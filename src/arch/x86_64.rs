@@ -159,19 +159,17 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
             let mut tmp = [c_init; MR];
 
             for k_block in 0..n_depth_blocks {
-                let bv = _mm256_loadu_si256(
-                    b_ptr.add(b_off + k_block * size_of::<__m256i>()) as *const __m256i
-                );
+                // nb. this assumes `NR * 4 == size_of::<__m256i>()`.
+                let bv = _mm256_loadu_si256(b_ptr.add(b_off + k_block * NR * 4) as *const __m256i);
                 b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8::<VNNI_TYPE>(bv));
 
-                let a_vals = _mm256_maskload_epi32(
-                    a_ptr.add(a_off + k_block * size_of::<__m256i>()) as *const i32,
-                    mask,
-                );
+                // nb. this assumes `MR * 4 <= size_of::<__m256i>()`.
+                let a_vals =
+                    _mm256_maskload_epi32(a_ptr.add(a_off + k_block * MR * 4) as *const i32, mask);
 
                 for i in 0..MR {
                     let av = _mm256_broadcast_ss(std::mem::transmute::<*const u8, &f32>(
-                        a_ptr.add(a_off + k_block * size_of::<__m256i>() + i),
+                        a_ptr.add(a_off + k_block * MR * 4 + i * 4),
                     ));
                     let av = std::mem::transmute::<__m256, __m256i>(av);
 

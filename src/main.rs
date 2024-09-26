@@ -199,7 +199,7 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale) {
 }
 
 fn main() {
-    let kernel = arch::new_kernel(Some(KernelHint::Generic));
+    let kernel = arch::new_kernel(Some(KernelHint::Avx));
 
     // Do a functional test with scale factor >1 in each dimension.
     let n_iters = 1;
