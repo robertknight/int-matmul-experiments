@@ -527,10 +527,11 @@ pub mod avx512 {
                         mask,
                         a_ptr.add(a_off + k_block * MR * 4) as *const i32,
                     );
-                    let a_elts = to_array::<i32, REG_SIZE>(a_vals);
 
                     for i in 0..MR {
-                        let av = _mm512_set1_epi32(a_elts[i]);
+                        let av = _mm512_set1_epi32(
+                            *(a_ptr.add(a_off + k_block * MR * 4 + i * 4) as *const i32),
+                        );
                         tmp[i] = dot_u8i8x64_i32x16::<VNNI_TYPE>(tmp[i], av, bv);
                     }
 
