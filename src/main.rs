@@ -141,6 +141,7 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 
     let start = std::time::Instant::now();
     for _ in 0..n_iters {
+        c.fill(0);
         kernel.pack_a(&mut packed_a, &a, m, k);
         kernel.pack_b(&mut packed_b, &b, k, n);
         kernel.matmul(
@@ -167,17 +168,23 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: usize) {
 
     let ref_c = reference_matmul_int(&a, &b, a_zero_point, b_zero_point, m, n, k);
 
-    if c != ref_c {
+    if c == ref_c {
         println!("Reference and optimized implementations match.");
     } else {
         println!("Reference and optimized implementations DO NOT MATCH.");
+
+        println!("\nActual:\n");
+        print_mat(&c, m, n);
+
+        println!("\nExpected:\n");
+        print_mat(&ref_c, m, n);
     }
 }
 
 fn main() {
-    let kernel = arch::new_kernel(Some(KernelHint::Generic));
-    let n_iters = 1000;
-    let scale = 100;
+    let kernel = arch::new_kernel(Some(KernelHint::Avx));
+    let n_iters = 1;
+    let scale = 1;
 
     // let n_iters = 1;
     // let scale = 20;
