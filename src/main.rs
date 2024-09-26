@@ -7,6 +7,7 @@
 mod arch;
 mod packing;
 
+#[allow(unused_imports)]
 use arch::KernelHint;
 
 /// Trait implemented by integer matmul kernels.
@@ -20,6 +21,8 @@ unsafe trait Kernel {
     fn new() -> Option<Self>
     where
         Self: Sized;
+
+    fn name(&self) -> &str;
 
     /// Return number of rows in this kernel's microtile.
     fn mr(&self) -> usize;
@@ -125,6 +128,7 @@ fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
 struct InputScale {
     m: usize,
     n: usize,
@@ -142,7 +146,14 @@ impl InputScale {
     }
 }
 
-fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale) {
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+enum ErrorDetail {
+    Short,
+    Verbose,
+}
+
+fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale, detail: ErrorDetail) {
     let m = std::hint::black_box(kernel.mr() * scale.m);
     let n = std::hint::black_box(kernel.nr() * scale.n);
     let k = std::hint::black_box(4 * scale.k);
@@ -190,27 +201,32 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale) {
     } else {
         println!("Reference and optimized implementations DO NOT MATCH.");
 
-        println!("\nActual:\n");
-        print_mat(&c, m, n);
+        if detail == ErrorDetail::Verbose {
+            println!("\nActual:\n");
+            print_mat(&c, m, n);
 
-        println!("\nExpected:\n");
-        print_mat(&ref_c, m, n);
+            println!("\nExpected:\n");
+            print_mat(&ref_c, m, n);
+        }
     }
 }
 
 fn main() {
-    let kernel = arch::new_kernel(Some(KernelHint::Avx));
+    let kernel = arch::new_kernel(None);
+    println!("Kernel: {}", kernel.name());
 
     // Do a functional test with scale factor >1 in each dimension.
     let n_iters = 1;
-    let scale = InputScale::uniform(2);
-    test_kernel(kernel.as_ref(), n_iters, scale);
+    let scale = InputScale { m: 3, n: 3, k: 3 };
+    test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Verbose);
 
     // Do a benchmark
     #[cfg(not(debug_assertions))]
     {
+        // let n_iters = 500;
+        // let scale = InputScale::uniform(100);
         let n_iters = 500;
         let scale = InputScale::uniform(100);
-        test_kernel(kernel.as_ref(), n_iters, scale);
+        test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Short);
     }
 }

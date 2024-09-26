@@ -2,8 +2,6 @@ use crate::Kernel;
 
 const MR: usize = 4;
 const NR: usize = 4;
-const NVEC: usize = 4;
-const NVEC_I8: usize = 16;
 
 fn matmul_int(
     c: &mut [i32],
@@ -101,6 +99,10 @@ impl Default for GenericKernel {
 unsafe impl Kernel for GenericKernel {
     fn new() -> Option<Self> {
         Some(GenericKernel::new())
+    }
+
+    fn name(&self) -> &str {
+        "generic"
     }
 
     fn mr(&self) -> usize {

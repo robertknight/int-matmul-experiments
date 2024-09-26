@@ -251,6 +251,14 @@ unsafe impl Kernel for AvxKernel {
         Some(AvxKernel { vnni })
     }
 
+    fn name(&self) -> &str {
+        match self.vnni {
+            VnniType::None => "avx",
+            VnniType::Avx => "avx(vnni)",
+            VnniType::Avx512 => "avx(vnni512)",
+        }
+    }
+
     /// Return number of rows in this kernel's microtile.
     fn mr(&self) -> usize {
         MR
@@ -379,7 +387,7 @@ pub mod avx512 {
     use std::arch::asm;
     use std::arch::x86_64::{
         __m512i, _mm512_add_epi32, _mm512_loadu_si512, _mm512_madd_epi16, _mm512_maddubs_epi16,
-        _mm512_mask_load_epi32, _mm512_mullo_epi32, _mm512_set1_epi16, _mm512_set1_epi32,
+        _mm512_mask_loadu_epi32, _mm512_mullo_epi32, _mm512_set1_epi16, _mm512_set1_epi32,
         _mm512_set1_epi8, _mm512_setzero_si512, _mm512_storeu_si512, _mm512_sub_epi32,
     };
 
@@ -402,7 +410,7 @@ pub mod avx512 {
     }
 
     #[target_feature(enable = "avx512f")]
-    unsafe fn dot_u8i8x32_i32x4<const VNNI_TYPE: u8>(
+    unsafe fn dot_u8i8x64_i32x16<const VNNI_TYPE: u8>(
         mut out: __m512i,
         x: __m512i,
         y: __m512i,
@@ -427,16 +435,16 @@ pub mod avx512 {
 
     /// Sum each group of 4 adjacent i8 values and produce i32 results.
     #[target_feature(enable = "avx512f")]
-    unsafe fn add_i8x32_i32x8<const VNNI_TYPE: u8>(x: __m512i) -> __m512i {
+    unsafe fn add_i8x64_i32x16<const VNNI_TYPE: u8>(x: __m512i) -> __m512i {
         let one = _mm512_set1_epi8(1);
-        dot_u8i8x32_i32x4::<VNNI_TYPE>(_mm512_setzero_si512(), one, x)
+        dot_u8i8x64_i32x16::<VNNI_TYPE>(_mm512_setzero_si512(), one, x)
     }
 
     /// Sum each group of 4 adjacent u8 values and produce i32 results.
     #[target_feature(enable = "avx512f")]
-    unsafe fn add_u8x32_i32x8<const VNNI_TYPE: u8>(x: __m512i) -> __m512i {
+    unsafe fn add_u8x64_i32x16<const VNNI_TYPE: u8>(x: __m512i) -> __m512i {
         let one = _mm512_set1_epi8(1);
-        dot_u8i8x32_i32x4::<VNNI_TYPE>(_mm512_setzero_si512(), x, one)
+        dot_u8i8x64_i32x16::<VNNI_TYPE>(_mm512_setzero_si512(), x, one)
     }
 
     #[target_feature(enable = "avx512f")]
@@ -495,7 +503,7 @@ pub mod avx512 {
 
         // Mask which is set for the first `MR` elements.
         assert!(MR <= 16);
-        let mask = 0u16 >> 16 - MR;
+        let mask = !0u16 >> 16 - MR;
 
         for col_block in 0..n_col_blocks {
             let b_off = col_block * n_depth_blocks * NR * 4;
@@ -511,24 +519,22 @@ pub mod avx512 {
                 let mut tmp = [c_init; MR];
 
                 for k_block in 0..n_depth_blocks {
-                    let bv = _mm512_loadu_si512(
-                        b_ptr.add(b_off + k_block * size_of::<__m512i>()) as *const i32
-                    );
-                    b_sum = _mm512_add_epi32(b_sum, add_i8x32_i32x8::<VNNI_TYPE>(bv));
+                    let bv = _mm512_loadu_si512(b_ptr.add(b_off + k_block * NR * 4) as *const i32);
+                    b_sum = _mm512_add_epi32(b_sum, add_i8x64_i32x16::<VNNI_TYPE>(bv));
 
-                    let a_vals = _mm512_mask_load_epi32(
+                    let a_vals = _mm512_mask_loadu_epi32(
                         _mm512_setzero_si512(),
                         mask,
-                        a_ptr.add(a_off + k_block * size_of::<__m512i>()) as *const i32,
+                        a_ptr.add(a_off + k_block * MR * 4) as *const i32,
                     );
-                    let a_elts = to_array::<i32, 16>(a_vals);
+                    let a_elts = to_array::<i32, REG_SIZE>(a_vals);
 
                     for i in 0..MR {
                         let av = _mm512_set1_epi32(a_elts[i]);
-                        tmp[i] = dot_u8i8x32_i32x4::<VNNI_TYPE>(tmp[i], av, bv);
+                        tmp[i] = dot_u8i8x64_i32x16::<VNNI_TYPE>(tmp[i], av, bv);
                     }
 
-                    a_sum = _mm512_add_epi32(a_sum, add_u8x32_i32x8::<VNNI_TYPE>(a_vals));
+                    a_sum = _mm512_add_epi32(a_sum, add_u8x64_i32x16::<VNNI_TYPE>(a_vals));
                 }
 
                 let a_sum = _mm512_mullo_epi32(a_sum, _mm512_set1_epi32(b_zero_point as i32));
@@ -566,6 +572,13 @@ pub mod avx512 {
             };
 
             Some(Avx512Kernel { vnni })
+        }
+
+        fn name(&self) -> &str {
+            match self.vnni {
+                VnniType::Avx512 => "avx512(vnni)",
+                _ => "avx512",
+            }
         }
 
         /// Return number of rows in this kernel's microtile.
