@@ -158,11 +158,21 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale, detail: E
     let n = std::hint::black_box(kernel.nr() * scale.n);
     let k = std::hint::black_box(4 * scale.k);
 
-    let a: Vec<u8> = (0..m * k).map(|x| x as u8).collect();
-    let b: Vec<i8> = (0..k * n).map(|x| x as i8).collect();
-    let mut c = vec![0i32; m * n];
     let a_zero_point = 5;
     let b_zero_point = -5;
+
+    // When using non-VNNI instructions on x64, VPMADDUBSW may saturate when
+    // adding adjacent signed 16-bit intermediate values. This can cause
+    // incorrect results. To avoid this, limit the maximum values in the input.
+    //
+    // If all values in the input are <= `isqrt(i16::MAX / 2)` (127) then
+    // overflow cannot happen. nb. This assumes that the zero point subtraction
+    // is performed at the end on the i32 values.
+    let max_val = 127;
+
+    let a: Vec<u8> = (0..m * k).map(|x| (x % max_val) as u8).collect();
+    let b: Vec<i8> = (0..k * n).map(|x| x as i8).collect();
+    let mut c = vec![0i32; m * n];
 
     let mut packed_a = vec![0; kernel.packed_a_size(m, k)];
     let mut packed_b = vec![0; kernel.packed_b_size(k, n)];
