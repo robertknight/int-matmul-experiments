@@ -205,10 +205,15 @@ fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale, detail: E
 
     let ref_c = reference_matmul_int(&a, &b, a_zero_point, b_zero_point, m, n, k);
 
-    if c == ref_c {
+    let n_differences = c.iter().zip(&ref_c).filter(|(x, y)| x != y).count();
+
+    if n_differences == 0 {
         println!("Reference and optimized implementations match.");
     } else {
-        println!("Reference and optimized implementations DO NOT MATCH.");
+        println!(
+            "Reference and optimized implementations DO NOT MATCH ({} differences)",
+            n_differences
+        );
 
         if detail == ErrorDetail::Verbose {
             println!("\nActual:\n");
