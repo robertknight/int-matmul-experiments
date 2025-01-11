@@ -129,16 +129,16 @@ fn print_mat<E: std::fmt::Display>(mat: &[E], m: usize, n: usize) {
 }
 
 #[derive(Copy, Clone, Debug)]
-struct InputScale {
+struct InputSize {
     m: usize,
     n: usize,
     k: usize,
 }
 
-impl InputScale {
+impl InputSize {
     #[allow(unused)]
     fn uniform(scale: usize) -> Self {
-        InputScale {
+        InputSize {
             m: scale,
             n: scale,
             k: scale,
@@ -153,10 +153,8 @@ enum ErrorDetail {
     Verbose,
 }
 
-fn test_kernel(kernel: &dyn Kernel, n_iters: usize, scale: InputScale, detail: ErrorDetail) {
-    let m = std::hint::black_box(kernel.mr() * scale.m);
-    let n = std::hint::black_box(kernel.nr() * scale.n);
-    let k = std::hint::black_box(4 * scale.k);
+fn test_kernel(kernel: &dyn Kernel, n_iters: usize, size: InputSize, detail: ErrorDetail) {
+    let InputSize { m, n, k } = size;
 
     let a_zero_point = 5;
     let b_zero_point = -5;
@@ -229,18 +227,20 @@ fn main() {
     let kernel = arch::new_kernel(None);
     println!("Kernel: {}", kernel.name());
 
-    // Do a functional test with scale factor >1 in each dimension.
+    // Size chosen to not be a multiple of tile size along any dimension.
+    let size = InputSize {
+        m: 25,
+        n: 13,
+        k: 15,
+    };
     let n_iters = 1;
-    let scale = InputScale { m: 3, n: 3, k: 3 };
-    test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Verbose);
+    test_kernel(kernel.as_ref(), n_iters, size, ErrorDetail::Verbose);
 
     // Do a benchmark
     // #[cfg(not(debug_assertions))]
     {
-        // let n_iters = 500;
-        // let scale = InputScale::uniform(100);
         let n_iters = 500;
-        let scale = InputScale::uniform(100);
-        test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Short);
+        let size = InputSize::uniform(512);
+        test_kernel(kernel.as_ref(), n_iters, size, ErrorDetail::Short);
     }
 }

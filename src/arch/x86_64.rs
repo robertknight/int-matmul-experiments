@@ -1,3 +1,4 @@
+use crate::packing::{pack_a_size, pack_b_size};
 use crate::Kernel;
 
 use std::arch::asm;
@@ -77,22 +78,17 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
     n: usize,
     k: usize,
 ) {
-    assert!(k % 4 == 0);
-    assert!(m % MR == 0);
-    assert!(n % NR == 0);
-
-    let col_block_size = NR;
-    let row_block_size = MR;
-    let depth_block_size = 4;
-    let n_col_blocks = n / col_block_size;
-    let n_row_blocks = m / MR;
-    let n_depth_blocks = k / depth_block_size;
+    let col_tile_size = NR;
+    let row_tile_size = MR;
+    let depth_tile_size = 4;
+    let n_col_tiles = n.div_ceil(col_tile_size);
+    let n_row_tiles = m.div_ceil(MR);
+    let n_depth_tiles = k.div_ceil(depth_tile_size);
 
     let b_ptr = b.as_ptr();
     let a_ptr = a.as_ptr();
     let c_ptr = c.as_mut_ptr();
 
-    // let a_row_stride = k;
     let c_row_stride = n;
 
     // The value for each output cell is computed as:
@@ -102,7 +98,7 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
     // This can be expanded and re-arranged into:
     //
     // c = a[0]b[0] - a[0] * b_zero_point - b[0] * a_zero_point + a_zero_point * b_zero_point + ...
-    // c = dot(a, b) - sum(a) * b_zero_point - sum(b) * a_zero_point + ... + len(a) * a_zero_point * b_zero_point
+    // c = dot(a, b) - sum(a) * b_zero_point - sum(b) * a_zero_point + k * a_zero_point * b_zero_point
     //
     // The final term of the above equation does not depend on any individual
     // elements, so is pre-computed and used as the initialization value for
@@ -120,26 +116,29 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
         ),
     );
 
-    let col_data_size = n_depth_blocks * NR * 4;
+    let col_data_size = n_depth_tiles * NR * 4;
     let col_sum_size = NR * 4;
     let b_panel_stride = col_data_size + col_sum_size;
 
-    let row_data_size = n_depth_blocks * MR * 4;
+    let row_data_size = n_depth_tiles * MR * 4;
     let row_sum_size = MR * 4;
     let a_panel_stride = row_data_size + row_sum_size;
 
-    assert_eq!(a.len(), n_row_blocks * a_panel_stride);
-    assert_eq!(b.len(), n_col_blocks * b_panel_stride);
+    assert_eq!(a.len(), n_row_tiles * a_panel_stride);
+    assert_eq!(b.len(), n_col_tiles * b_panel_stride);
 
-    for col_block in 0..n_col_blocks {
-        let b_off = col_block * b_panel_stride;
+    for col_tile in 0..n_col_tiles {
+        let b_off = col_tile * b_panel_stride;
 
-        for row_block in 0..n_row_blocks {
-            let a_off = row_block * a_panel_stride;
+        for row_tile in 0..n_row_tiles {
+            let a_off = row_tile * a_panel_stride;
 
+            // MR x NR accumulator in registers.
             let mut tmp = [c_init; MR];
 
-            for k_block in 0..n_depth_blocks {
+            // Loop over K dimension and compute dot product of `[MR, 4]` tiles
+            // of A with `[4, NR]` tiles of B.
+            for k_block in 0..n_depth_tiles {
                 // nb. this assumes `NR * 4 == size_of::<__m256i>()`.
                 let bv = _mm256_loadu_si256(b_ptr.add(b_off + k_block * NR * 4) as *const __m256i);
 
@@ -152,20 +151,42 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
                 }
             }
 
+            // Subtract scaled zero points from accumulated values.
             let a_sum = _mm256_loadu_si256(a_ptr.add(a_off + row_data_size) as *const __m256i);
             let a_sum = _mm256_mullo_epi32(a_sum, _mm256_set1_epi32(b_zero_point as i32));
-
             let b_sum = _mm256_loadu_si256(b_ptr.add(b_off + col_data_size) as *const __m256i);
             let b_sum = _mm256_mullo_epi32(b_sum, _mm256_set1_epi32(a_zero_point as i32));
-
             let a_sums = to_array::<i32, NR>(a_sum);
             for i in 0..MR {
+                tmp[i] = _mm256_sub_epi32(tmp[i], b_sum);
+                tmp[i] = _mm256_sub_epi32(tmp[i], _mm256_set1_epi32(a_sums[i]));
+            }
+
+            // Write from temporary tile in registers back to output.
+            let used_rows = (m - row_tile * MR).min(MR);
+            let used_cols = (n - col_tile * NR).min(NR);
+
+            let output_tile_ptr = |row| {
                 let c_off =
-                    (row_block * row_block_size + i) * c_row_stride + (col_block * col_block_size);
-                let z = tmp[i];
-                let z = _mm256_sub_epi32(z, b_sum);
-                let z = _mm256_sub_epi32(z, _mm256_set1_epi32(a_sums[i]));
-                _mm256_storeu_si256(c_ptr.add(c_off) as *mut __m256i, z);
+                    (row_tile * row_tile_size + row) * c_row_stride + (col_tile * col_tile_size);
+                c_ptr.add(c_off)
+            };
+
+            if used_rows == MR && used_cols == NR {
+                // Full output tile
+                for i in 0..MR {
+                    let tile_ptr = output_tile_ptr(i);
+                    _mm256_storeu_si256(tile_ptr as *mut __m256i, tmp[i]);
+                }
+            } else {
+                // Partial output tile
+                for i in 0..used_rows {
+                    let tile_ptr = output_tile_ptr(i);
+                    let tmp = to_array::<i32, NR>(tmp[i]);
+                    for c in 0..used_cols {
+                        *tile_ptr.add(c) = tmp[c];
+                    }
+                }
             }
         }
     }
@@ -247,8 +268,7 @@ unsafe impl Kernel for AvxKernel {
 
     /// Return size of packing buffer required by `pack_a`.
     fn packed_a_size(&self, a_rows: usize, a_cols: usize) -> usize {
-        // Packed u8 data + i32 row sums
-        a_rows * a_cols + a_rows * 4
+        pack_a_size::<MR>(a_rows, a_cols)
     }
 
     /// Pack an input LHS / "A" matrix
@@ -258,8 +278,7 @@ unsafe impl Kernel for AvxKernel {
 
     /// Return size of packing buffer required by `pack_b`.
     fn packed_b_size(&self, b_rows: usize, b_cols: usize) -> usize {
-        // Packed i8 data + i32 col sums
-        b_rows * b_cols + b_cols * 4
+        pack_b_size::<NR>(b_rows, b_cols)
     }
 
     /// Pack an input RHS / "B" matrix
@@ -572,8 +591,7 @@ pub mod avx512 {
 
         /// Return size of packing buffer required by `pack_a`.
         fn packed_a_size(&self, a_rows: usize, a_cols: usize) -> usize {
-            // Packed u8 data + i32 row sums
-            a_rows * a_cols + a_rows * 4
+            pack_a_size::<MR>(a_rows, a_cols)
         }
 
         /// Pack an input LHS / "A" matrix
@@ -583,8 +601,7 @@ pub mod avx512 {
 
         /// Return size of packing buffer required by `pack_b`.
         fn packed_b_size(&self, b_rows: usize, b_cols: usize) -> usize {
-            // Packed i8 data + i32 col sums
-            b_rows * b_cols + b_cols * 4
+            pack_b_size::<NR>(b_rows, b_cols)
         }
 
         /// Pack an input RHS / "B" matrix
