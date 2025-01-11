@@ -23,13 +23,13 @@ impl<'a, T> SliceWriter<'a, T> {
         self.offset += 1;
     }
 
-    /// Write `len` zeros to the slice.
-    unsafe fn write_zeros_unchecked(&mut self, len: usize)
+    /// Write `len` copies of `val` to the slice.
+    unsafe fn write_n_unchecked(&mut self, len: usize, val: T)
     where
-        T: Default,
+        T: Copy,
     {
         for i in 0..len {
-            *self.slice.get_unchecked_mut(self.offset + i) = T::default();
+            *self.slice.get_unchecked_mut(self.offset + i) = val;
         }
         self.offset += len;
     }
@@ -67,40 +67,39 @@ pub fn pack_b<const NR: usize>(out: &mut [i8], vals: &[i8], b_rows: usize, b_col
             let row_range = row_tile * K_TILE..(row_tile * K_TILE + K_TILE).min(b_rows);
             if col_range.len() == NR && row_range.len() == K_TILE {
                 // Full tile
-                for col_off in 0..NR {
-                    for row_off in 0..K_TILE {
-                        let y = row_tile * K_TILE + row_off;
-                        let x = col_tile * NR + col_off;
+                for c in 0..NR {
+                    for r in 0..K_TILE {
+                        let y = row_tile * K_TILE + r;
+                        let x = col_tile * NR + c;
                         unsafe {
                             let val = *vals.get_unchecked(y * b_row_stride + x);
-                            col_sums[col_off] += val as i32;
+                            col_sums[c] += val as i32;
                             out.write_unchecked(val);
                         }
                     }
                 }
             } else {
                 // Partial tile
-                for col_off in 0..col_range.len() {
-                    for row_off in 0..row_range.len() {
-                        let y = row_tile * K_TILE + row_off;
-                        let x = col_tile * NR + col_off;
+                for c in 0..col_range.len() {
+                    for r in 0..row_range.len() {
+                        let y = row_tile * K_TILE + r;
+                        let x = col_tile * NR + c;
                         unsafe {
                             let val = *vals.get_unchecked(y * b_row_stride + x);
-                            col_sums[col_off] += val as i32;
+                            col_sums[c] += val as i32;
                             out.write_unchecked(val);
                         }
                     }
                     // Pad to row tile size
-                    unsafe { out.write_zeros_unchecked(K_TILE - row_range.len()) };
+                    unsafe { out.write_n_unchecked(K_TILE - row_range.len(), 0) };
                 }
                 // Pad to column tile size
-                unsafe { out.write_zeros_unchecked((NR - col_range.len()) * K_TILE) };
+                unsafe { out.write_n_unchecked((NR - col_range.len()) * K_TILE, 0) };
             }
         }
 
-        debug_assert_eq!(out.offset % 4, 0);
-        for col_off in 0..NR {
-            let col_sum_i8 = col_sums[col_off].to_ne_bytes().map(|b| b as i8);
+        for c in 0..NR {
+            let col_sum_i8 = col_sums[c].to_ne_bytes().map(|b| b as i8);
             for i in 0..4 {
                 unsafe {
                     out.write_unchecked(col_sum_i8[i]);
@@ -143,43 +142,43 @@ pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_col
 
             if row_range.len() == MR && col_range.len() == K_TILE {
                 // Full tile
-                for row_off in 0..MR {
-                    for col_off in 0..K_TILE {
-                        let y = row_tile * MR + row_off;
-                        let x = col_tile * K_TILE + col_off;
+                for r in 0..MR {
+                    for c in 0..K_TILE {
+                        let y = row_tile * MR + r;
+                        let x = col_tile * K_TILE + c;
                         unsafe {
                             let val = *vals.get_unchecked(y * a_row_stride + x);
-                            row_sums[row_off] += val as i32;
+                            row_sums[r] += val as i32;
                             out.write_unchecked(val);
                         }
                     }
                 }
             } else {
                 // Partial tile
-                for row_off in 0..row_range.len() {
-                    for col_off in 0..col_range.len() {
-                        let y = row_tile * MR + row_off;
-                        let x = col_tile * K_TILE + col_off;
+                for r in 0..row_range.len() {
+                    for c in 0..col_range.len() {
+                        let y = row_tile * MR + r;
+                        let x = col_tile * K_TILE + c;
                         unsafe {
                             let val = *vals.get_unchecked(y * a_row_stride + x);
-                            row_sums[row_off] += val as i32;
+                            row_sums[r] += val as i32;
                             out.write_unchecked(val);
                         }
                     }
                     // Pad to column tile size
                     unsafe {
-                        out.write_zeros_unchecked(K_TILE - col_range.len());
+                        out.write_n_unchecked(K_TILE - col_range.len(), 0);
                     }
                 }
                 // Pad to row tile size
                 unsafe {
-                    out.write_zeros_unchecked((MR - row_range.len()) * K_TILE);
+                    out.write_n_unchecked((MR - row_range.len()) * K_TILE, 0);
                 }
             }
         }
 
-        for row_off in 0..MR {
-            let row_sum_u8 = row_sums[row_off].to_ne_bytes();
+        for r in 0..MR {
+            let row_sum_u8 = row_sums[r].to_ne_bytes();
             for i in 0..4 {
                 unsafe {
                     out.write_unchecked(row_sum_u8[i]);
