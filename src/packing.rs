@@ -1,5 +1,41 @@
 const K_TILE: usize = 4;
 
+/// Helper for incrementally filling a slice.
+struct SliceWriter<'a, T> {
+    offset: usize,
+    slice: &'a mut [T],
+}
+
+impl<'a, T> SliceWriter<'a, T> {
+    fn new(slice: &'a mut [T]) -> Self {
+        SliceWriter { slice, offset: 0 }
+    }
+
+    /// Return true if the slice has been fully written.
+    fn completed(&self) -> bool {
+        self.offset == self.slice.len()
+    }
+
+    /// Write the next element in the slice.
+    unsafe fn write_unchecked(&mut self, val: T) {
+        debug_assert!(self.offset < self.slice.len());
+        *self.slice.get_unchecked_mut(self.offset) = val;
+        self.offset += 1;
+    }
+
+    /// Write `len` zeros to the slice.
+    unsafe fn write_zeros_unchecked(&mut self, len: usize)
+    where
+        T: Default,
+    {
+        for i in 0..len {
+            *self.slice.get_unchecked_mut(self.offset + i) = T::default();
+        }
+        self.offset += len;
+    }
+}
+
+/// Return the size of packing buffer required by `pack_b`.
 pub fn pack_b_size<const NR: usize>(b_rows: usize, b_cols: usize) -> usize {
     // Packed block is padded to a multiple of NR columns and K_TILE rows.
     let n_panels = b_cols.div_ceil(NR);
@@ -21,7 +57,7 @@ pub fn pack_b<const NR: usize>(out: &mut [i8], vals: &[i8], b_rows: usize, b_col
     assert_eq!(out.len(), pack_b_size::<NR>(b_rows, b_cols));
 
     let b_row_stride = b_cols;
-    let mut out_off = 0;
+    let mut out = SliceWriter::new(out);
 
     for col_tile in 0..b_cols.div_ceil(NR) {
         let mut col_sums = [0i32; NR];
@@ -38,8 +74,7 @@ pub fn pack_b<const NR: usize>(out: &mut [i8], vals: &[i8], b_rows: usize, b_col
                         unsafe {
                             let val = *vals.get_unchecked(y * b_row_stride + x);
                             col_sums[col_off] += val as i32;
-                            *out.get_unchecked_mut(out_off) = val;
-                            out_off += 1;
+                            out.write_unchecked(val);
                         }
                     }
                 }
@@ -52,43 +87,32 @@ pub fn pack_b<const NR: usize>(out: &mut [i8], vals: &[i8], b_rows: usize, b_col
                         unsafe {
                             let val = *vals.get_unchecked(y * b_row_stride + x);
                             col_sums[col_off] += val as i32;
-                            *out.get_unchecked_mut(out_off) = val;
-                            out_off += 1;
+                            out.write_unchecked(val);
                         }
                     }
-                    for _row_off in row_range.len()..K_TILE {
-                        unsafe {
-                            *out.get_unchecked_mut(out_off) = 0;
-                        }
-                        out_off += 1;
-                    }
+                    // Pad to row tile size
+                    unsafe { out.write_zeros_unchecked(K_TILE - row_range.len()) };
                 }
-                for _ in col_range.len()..NR {
-                    for _row_off in 0..K_TILE {
-                        unsafe {
-                            *out.get_unchecked_mut(out_off) = 0;
-                        }
-                        out_off += 1;
-                    }
-                }
+                // Pad to column tile size
+                unsafe { out.write_zeros_unchecked((NR - col_range.len()) * K_TILE) };
             }
         }
 
-        debug_assert_eq!(out_off % 4, 0);
+        debug_assert_eq!(out.offset % 4, 0);
         for col_off in 0..NR {
             let col_sum_i8 = col_sums[col_off].to_ne_bytes().map(|b| b as i8);
             for i in 0..4 {
                 unsafe {
-                    *out.get_unchecked_mut(out_off) = col_sum_i8[i];
+                    out.write_unchecked(col_sum_i8[i]);
                 }
-                out_off += 1;
             }
         }
     }
 
-    assert_eq!(out_off, out.len());
+    assert!(out.completed());
 }
 
+/// Return the size of packing buffer required by `pack_a`.
 pub fn pack_a_size<const MR: usize>(a_rows: usize, a_cols: usize) -> usize {
     // Packed block is padded to a multiple of MR rows and K_TILE columns.
     let n_panels = a_rows.div_ceil(MR);
@@ -106,9 +130,9 @@ pub fn pack_a_size<const MR: usize>(a_rows: usize, a_cols: usize) -> usize {
 // used to handle subtraction of the zero point.
 pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_cols: usize) {
     assert_eq!(out.len(), pack_a_size::<MR>(a_rows, a_cols));
+    let mut out = SliceWriter::new(out);
 
     let a_row_stride = a_cols;
-    let mut out_off = 0;
 
     for row_tile in 0..a_rows.div_ceil(MR) {
         let mut row_sums = [0i32; MR];
@@ -126,8 +150,7 @@ pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_col
                         unsafe {
                             let val = *vals.get_unchecked(y * a_row_stride + x);
                             row_sums[row_off] += val as i32;
-                            *out.get_unchecked_mut(out_off) = val;
-                            out_off += 1;
+                            out.write_unchecked(val);
                         }
                     }
                 }
@@ -140,22 +163,17 @@ pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_col
                         unsafe {
                             let val = *vals.get_unchecked(y * a_row_stride + x);
                             row_sums[row_off] += val as i32;
-                            *out.get_unchecked_mut(out_off) = val;
-                            out_off += 1;
+                            out.write_unchecked(val);
                         }
                     }
-                    for _col_off in col_range.len()..K_TILE {
-                        unsafe {
-                            *out.get_unchecked_mut(out_off) = 0;
-                            out_off += 1;
-                        }
+                    // Pad to column tile size
+                    unsafe {
+                        out.write_zeros_unchecked(K_TILE - col_range.len());
                     }
                 }
-                for _row_off in row_range.len()..MR {
-                    for _col_off in 0..K_TILE {
-                        unsafe { *out.get_unchecked_mut(out_off) = 0 };
-                        out_off += 1;
-                    }
+                // Pad to row tile size
+                unsafe {
+                    out.write_zeros_unchecked((MR - row_range.len()) * K_TILE);
                 }
             }
         }
@@ -164,12 +182,11 @@ pub fn pack_a<const MR: usize>(out: &mut [u8], vals: &[u8], a_rows: usize, a_col
             let row_sum_u8 = row_sums[row_off].to_ne_bytes();
             for i in 0..4 {
                 unsafe {
-                    *out.get_unchecked_mut(out_off) = row_sum_u8[i];
+                    out.write_unchecked(row_sum_u8[i]);
                 }
-                out_off += 1;
             }
         }
     }
 
-    assert_eq!(out_off, out.len());
+    assert!(out.completed());
 }
