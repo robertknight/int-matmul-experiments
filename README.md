@@ -10,3 +10,4 @@ matrix multiplication kernels for [RTen](https://github.com/robertknight/rten).
 - [Lower numerical precision deep learning inference and training (Intel white
 paper)](https://www.intel.com/content/dam/develop/external/us/en/documents/lower-numerical-precision-deep-learning-jan2018-754765.pdf)
 - [WikiChip page for VNNI instructions](https://en.wikichip.org/wiki/x86/avx512_vnni)
+- [WASM Relaxed SIMD dot product instruction design](https://github.com/WebAssembly/relaxed-simd/issues/52)
