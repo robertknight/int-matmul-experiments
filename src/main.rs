@@ -235,7 +235,7 @@ fn main() {
     test_kernel(kernel.as_ref(), n_iters, scale, ErrorDetail::Verbose);
 
     // Do a benchmark
-    #[cfg(not(debug_assertions))]
+    // #[cfg(not(debug_assertions))]
     {
         // let n_iters = 500;
         // let scale = InputScale::uniform(100);

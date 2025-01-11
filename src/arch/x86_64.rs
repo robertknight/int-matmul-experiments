@@ -3,9 +3,8 @@ use crate::Kernel;
 use std::arch::asm;
 use std::arch::x86_64::{
     __cpuid_count, __m256, __m256i, _mm256_add_epi32, _mm256_broadcast_ss, _mm256_loadu_si256,
-    _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_maskload_epi32, _mm256_mullo_epi32,
-    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_epi8, _mm256_setzero_si256,
-    _mm256_storeu_si256, _mm256_sub_epi32,
+    _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mullo_epi32, _mm256_set1_epi16,
+    _mm256_set1_epi32, _mm256_storeu_si256, _mm256_sub_epi32,
 };
 
 const VNNI_NONE: u8 = 0;
@@ -19,11 +18,7 @@ enum VnniType {
     Avx512,
 }
 
-/// Number of rows in tiles used by microkernel. Empirically 7 is the maximum
-/// value for the current implementation and performance drops a lot with
-/// larger values.
-const MR: usize = 7;
-
+const MR: usize = size_of::<__m256i>() / size_of::<i32>();
 const NR: usize = size_of::<__m256i>() / size_of::<i32>();
 
 /// Convert a SIMD vector into a `[T; N]` array.
@@ -68,22 +63,6 @@ unsafe fn dot_u8i8x32_i32x4<const VNNI_TYPE: u8>(
         let tmp = _mm256_madd_epi16(tmp, _mm256_set1_epi16(1));
         _mm256_add_epi32(out, tmp)
     }
-}
-
-/// Sum each group of 4 adjacent i8 values and produce i32 results.
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn add_i8x32_i32x8<const VNNI_TYPE: u8>(x: __m256i) -> __m256i {
-    let one = _mm256_set1_epi8(1);
-    dot_u8i8x32_i32x4::<VNNI_TYPE>(_mm256_setzero_si256(), one, x)
-}
-
-/// Sum each group of 4 adjacent u8 values and produce i32 results.
-#[target_feature(enable = "avx")]
-#[target_feature(enable = "avx2")]
-unsafe fn add_u8x32_i32x8<const VNNI_TYPE: u8>(x: __m256i) -> __m256i {
-    let one = _mm256_set1_epi8(1);
-    dot_u8i8x32_i32x4::<VNNI_TYPE>(_mm256_setzero_si256(), x, one)
 }
 
 #[target_feature(enable = "avx")]
@@ -141,45 +120,42 @@ unsafe fn matmul_int<const VNNI_TYPE: u8>(
         ),
     );
 
-    // Mask which is set for the first `MR` elements.
-    let mask_values: [i32; NR] = std::array::from_fn(|i| if i < MR { -1 } else { 0 });
-    let mask = _mm256_loadu_si256(mask_values.as_ptr() as *const __m256i);
+    let col_data_size = n_depth_blocks * NR * 4;
+    let col_sum_size = NR * 4;
+    let b_panel_stride = col_data_size + col_sum_size;
+
+    let row_data_size = n_depth_blocks * MR * 4;
+    let row_sum_size = MR * 4;
+    let a_panel_stride = row_data_size + row_sum_size;
+
+    assert_eq!(a.len(), n_row_blocks * a_panel_stride);
+    assert_eq!(b.len(), n_col_blocks * b_panel_stride);
 
     for col_block in 0..n_col_blocks {
-        let b_off = col_block * n_depth_blocks * NR * 4;
+        let b_off = col_block * b_panel_stride;
 
         for row_block in 0..n_row_blocks {
-            let a_off = row_block * n_depth_blocks * MR * 4;
-
-            // Sums along each row of `a`.
-            let mut a_sum = _mm256_setzero_si256();
-            // Sums along each column of `b`.
-            let mut b_sum = _mm256_setzero_si256();
+            let a_off = row_block * a_panel_stride;
 
             let mut tmp = [c_init; MR];
 
             for k_block in 0..n_depth_blocks {
                 // nb. this assumes `NR * 4 == size_of::<__m256i>()`.
                 let bv = _mm256_loadu_si256(b_ptr.add(b_off + k_block * NR * 4) as *const __m256i);
-                b_sum = _mm256_add_epi32(b_sum, add_i8x32_i32x8::<VNNI_TYPE>(bv));
-
-                // nb. this assumes `MR * 4 <= size_of::<__m256i>()`.
-                let a_vals =
-                    _mm256_maskload_epi32(a_ptr.add(a_off + k_block * MR * 4) as *const i32, mask);
 
                 for i in 0..MR {
                     let av = _mm256_broadcast_ss(std::mem::transmute::<*const u8, &f32>(
                         a_ptr.add(a_off + k_block * MR * 4 + i * 4),
                     ));
                     let av = std::mem::transmute::<__m256, __m256i>(av);
-
                     tmp[i] = dot_u8i8x32_i32x4::<VNNI_TYPE>(tmp[i], av, bv);
                 }
-
-                a_sum = _mm256_add_epi32(a_sum, add_u8x32_i32x8::<VNNI_TYPE>(a_vals));
             }
 
+            let a_sum = _mm256_loadu_si256(a_ptr.add(a_off + row_data_size) as *const __m256i);
             let a_sum = _mm256_mullo_epi32(a_sum, _mm256_set1_epi32(b_zero_point as i32));
+
+            let b_sum = _mm256_loadu_si256(b_ptr.add(b_off + col_data_size) as *const __m256i);
             let b_sum = _mm256_mullo_epi32(b_sum, _mm256_set1_epi32(a_zero_point as i32));
 
             let a_sums = to_array::<i32, NR>(a_sum);
@@ -271,7 +247,8 @@ unsafe impl Kernel for AvxKernel {
 
     /// Return size of packing buffer required by `pack_a`.
     fn packed_a_size(&self, a_rows: usize, a_cols: usize) -> usize {
-        a_rows * a_cols
+        // Packed u8 data + i32 row sums
+        a_rows * a_cols + a_rows * 4
     }
 
     /// Pack an input LHS / "A" matrix
@@ -281,7 +258,8 @@ unsafe impl Kernel for AvxKernel {
 
     /// Return size of packing buffer required by `pack_b`.
     fn packed_b_size(&self, b_rows: usize, b_cols: usize) -> usize {
-        b_rows * b_cols
+        // Packed i8 data + i32 col sums
+        b_rows * b_cols + b_cols * 4
     }
 
     /// Pack an input RHS / "B" matrix
@@ -594,7 +572,8 @@ pub mod avx512 {
 
         /// Return size of packing buffer required by `pack_a`.
         fn packed_a_size(&self, a_rows: usize, a_cols: usize) -> usize {
-            a_rows * a_cols
+            // Packed u8 data + i32 row sums
+            a_rows * a_cols + a_rows * 4
         }
 
         /// Pack an input LHS / "A" matrix
@@ -604,7 +583,8 @@ pub mod avx512 {
 
         /// Return size of packing buffer required by `pack_b`.
         fn packed_b_size(&self, b_rows: usize, b_cols: usize) -> usize {
-            b_rows * b_cols
+            // Packed i8 data + i32 col sums
+            b_rows * b_cols + b_cols * 4
         }
 
         /// Pack an input RHS / "B" matrix
