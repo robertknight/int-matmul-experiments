@@ -1,4 +1,4 @@
-# matmul-experiments
+# int-matmul-experiments
 
 This repository contains some experiments related to development of quantized
 matrix multiplication kernels for [RTen](https://github.com/robertknight/rten).
